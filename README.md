@@ -1,11 +1,22 @@
-<div align="center">
+# BizonVR Club Control
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+This repository combines the MVP requirements for the BizonVR Meta Quest management system.
+We utilize a full-stack Node.js + Express + React architecture configured to run on a single cloud service to ease deployment and meet AI Studio runtime requirements, while splitting out the local components.
 
-  <h1>Built with AI Studio</h2>
+## Directory Structure
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+*   \`/src/server/\` and \`server.ts\` - **Cloud Backend** (Express, standard REST API + SQLite mock for MVP)
+*   \`/src/components/\` and \`/src/pages/\` - **Web Operator Panel** (React, Tailwind, TanStack Query)
+*   \`/local-hub/\` - **Local Hub** (Node.js script polling the backend for device commands)
+*   \`/quest-agent/\` - **Quest Agent** Boilerplate (Android/Kotlin layout)
+*   \`/docs/\` - Documentation files
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+## Running the Architecture
 
-</div>
+1.  The cloud backend and web UI run via \`npm run dev\`.
+2.  The local hub runs via \`node local-hub/hub.js\`.
+
+## Constraints Addressed
+- Command chain: Web -> Cloud API -> DeviceCommand DB -> Local Hub Sync.
+- No direct cloud-to-device ADB.
+- Safe process runners for ADB commands.

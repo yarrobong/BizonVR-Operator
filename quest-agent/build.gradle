@@ -1,5 +1,33 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+
+    configurations.classpath {
+        resolutionStrategy.force(
+            "org.jetbrains.kotlin:kotlin-compiler-embeddable:2.1.0",
+            "org.jetbrains.kotlin:kotlin-daemon-client:2.1.0",
+            "org.jetbrains.kotlin:kotlin-reflect:2.1.0",
+            "org.jetbrains.kotlin:kotlin-stdlib:2.1.0",
+            "org.jetbrains.kotlin:kotlin-stdlib-jdk7:2.1.0",
+            "org.jetbrains.kotlin:kotlin-stdlib-jdk8:2.1.0"
+        )
+    }
+
+    dependencies {
+        classpath "com.android.tools.build:gradle:8.5.0"
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0"
+        classpath "org.jetbrains.kotlin:compose-compiler-gradle-plugin:2.1.0"
+        classpath "com.meta.spatial:spatial-gradle-plugin-impl:0.13.0"
+    }
+}
+
 apply plugin: 'com.android.application'
-apply plugin: 'kotlin-android'
+apply plugin: 'org.jetbrains.kotlin.android'
+apply plugin: 'org.jetbrains.kotlin.plugin.compose'
+apply plugin: 'com.meta.spatial.plugin'
 
 android {
     namespace 'com.bizonvr.questagent'
@@ -7,10 +35,14 @@ android {
 
     defaultConfig {
         applicationId "com.bizonvr.questagent"
-        minSdk 29
-        targetSdk 32 // Quest optimal
+        minSdk 34
+        targetSdk 34
         versionCode 1
         versionName "1.0"
+    }
+
+    packaging {
+        resources.excludes.add("META-INF/LICENSE")
     }
 
     buildTypes {
@@ -19,17 +51,47 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+
+    buildFeatures {
+        viewBinding true
+        compose true
+        buildConfig true
     }
+
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.15"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
     kotlinOptions {
-        jvmTarget = '1.8'
+        jvmTarget = '17'
     }
 }
 
 dependencies {
-    implementation 'androidx.core:core-ktx:1.10.1'
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.google.android.material:material:1.9.0'
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.6'
+    implementation 'androidx.activity:activity-compose:1.9.2'
+    implementation platform('androidx.compose:compose-bom:2024.09.03')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'com.meta.spatial:meta-spatial-sdk:0.13.0'
+    implementation 'com.meta.spatial:meta-spatial-sdk-compose:0.13.0'
+    implementation 'com.meta.spatial:meta-spatial-sdk-toolkit:0.13.0'
+    implementation 'com.meta.spatial:meta-spatial-sdk-vr:0.13.0'
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+}
+
+spatial {
+    allowUsageDataCollection.set(true)
 }

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BizonVR Quest Agent</string>
+
+    <string name="title_waiting">BizonVR Club Mode</string>
+    <string name="status_waiting">Ожидание запуска</string>
+    <string name="desc_waiting">Оператор скоро начнёт игру</string>
+
+    <string name="status_starting">Подготовка игры</string>
+    <string name="desc_starting">Пожалуйста, наденьте шлем удобно. Игра скоро запустится.</string>
+
+    <string name="status_active">Сессия активна</string>
+    <string name="timer_remaining">Осталось %1$s</string>
+
+    <string name="status_five_minutes">Осталось 5 минут</string>
+    <string name="desc_five_minutes">Если хотите продлить время — позовите оператора</string>
+
+    <string name="status_finished">Сессия завершена</string>
+    <string name="desc_finished">Пожалуйста, снимите шлем и передайте его оператору</string>
+
+    <string name="status_error">Нужна помощь оператора</string>
+    <string name="desc_error">Шлем временно не готов к запуску</string>
+
+    <string name="btn_call_operator">Вызвать оператора</string>
+    <string name="btn_game_menu">Меню игр</string>
+    <string name="btn_exit_kiosk">Выход из киоска</string>
+
+    <string name="operator_called">ОПЕРАТОР ВЫЗВАН</string>
+</resources>

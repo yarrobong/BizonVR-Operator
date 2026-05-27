@@ -1,198 +1,141 @@
 package com.bizonvr.questagent
 
-import android.content.Context
 import android.content.Intent
-import android.graphics.Color
+import android.content.pm.ActivityInfo
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.view.Gravity
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
-import android.widget.Toast
-import android.app.AlertDialog
 import android.text.InputType
+import android.util.Log
+import android.view.View
 import android.widget.EditText
-import android.app.ActivityManager
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import java.util.UUID
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.bizonvr.questagent.databinding.ActivityMainBinding
+import kotlinx.coroutines.launch
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), AgentSessionCallbacks {
+    companion object {
+        private const val TAG = "BizonVRQuestAgent"
+    }
 
-    private lateinit var statusText: TextView
-    private lateinit var pairingIdText: TextView
-    private lateinit var timerText: TextView
-    private lateinit var callOperatorBtn: Button
-    private lateinit var kioskBtn: Button
+    private lateinit var binding: ActivityMainBinding
+    private lateinit var sessionController: AgentSessionController
 
-    private var pairingId: String = ""
-    private var inSession: Boolean = false
-    private var sessionSeconds: Int = 0
-    private var sessionDurationMinutes: Int = 30
-    private var sessionPackage: String? = null
-    private var fiveMinsWarned: Boolean = false
     private var isKioskMode: Boolean = false
 
-    private val handler = Handler(Looper.getMainLooper())
-    private val heartbeatRunnable = object : Runnable {
-        override fun run() {
-            if (inSession) {
-                sessionSeconds += 5
-                
-                val remainingSeconds = (sessionDurationMinutes * 60) - sessionSeconds
-                if (remainingSeconds <= 300 && remainingSeconds > 0 && !fiveMinsWarned) {
-                    fiveMinsWarned = true
-                    showFiveMinuteWarning()
-                } else if (remainingSeconds <= 0) {
-                    endSessionAutomatically()
-                }
-                
-                updateTimerDisplay()
-            }
-            sendHeartbeat()
-            handler.postDelayed(this, 5000) // 5 second heartbeat
+    private fun enterFullscreen() {
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        )
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            enterFullscreen()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        pairingId = generatePairingId()
+        enterFullscreen()
+        Log.i(TAG, "onCreate")
 
-        val rootLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setBackgroundColor(Color.parseColor("#0F1115"))
-            setPadding(32, 32, 32, 32)
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        sessionController = AgentSessionController(this, this)
+
+        binding.callOperatorBtn.setOnClickListener {
+            sessionController.callOperator()
         }
-
-        val titleText = TextView(this).apply {
-            text = "BizonVR Club Launcher"
-            textSize = 32f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 32)
+        binding.menuBtn.setOnClickListener {
+            Toast.makeText(this, "Загрузка списка игр...", Toast.LENGTH_SHORT).show()
         }
-
-        pairingIdText = TextView(this).apply {
-            text = "Pairing ID: $pairingId"
-            textSize = 24f
-            setTextColor(Color.parseColor("#3B82F6"))
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 48)
-        }
-
-        statusText = TextView(this).apply {
-            text = "Status: WAITING FOR SESSION"
-            textSize = 28f
-            setTextColor(Color.parseColor("#10B981"))
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 24)
-        }
-
-        timerText = TextView(this).apply {
-            text = "00:00"
-            textSize = 48f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 48)
-        }
-
-        callOperatorBtn = Button(this).apply {
-            text = "CALL OPERATOR"
-            textSize = 24f
-            setBackgroundColor(Color.parseColor("#EF4444"))
-            setTextColor(Color.WHITE)
-            setPadding(32, 16, 32, 16)
-            setOnClickListener {
-                callOperator()
+        binding.kioskBtn.setOnClickListener {
+            if (isKioskMode) {
+                promptExitKiosk()
             }
         }
 
-        kioskBtn = Button(this).apply {
-            text = "ENTER KIOSK MODE"
-            textSize = 18f
-            setBackgroundColor(Color.parseColor("#374151"))
-            setTextColor(Color.WHITE)
-            setPadding(32, 16, 32, 16)
-            setOnClickListener {
-                if (isKioskMode) {
-                    promptExitKiosk()
-                } else {
-                    try {
-                        startLockTask()
-                        isKioskMode = true
-                        text = "EXIT KIOSK MODE"
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-            }
-        }
-
-        rootLayout.addView(titleText)
-        rootLayout.addView(pairingIdText)
-        rootLayout.addView(statusText)
-        rootLayout.addView(timerText)
-        rootLayout.addView(callOperatorBtn)
-        
-        val spacer = android.view.View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(1, 48)
-        }
-        rootLayout.addView(spacer)
-        rootLayout.addView(kioskBtn)
-
-        setContentView(rootLayout)
-        
-        handleIntent(intent)
-        startHeartbeat()
+        observeLauncherState()
+        sessionController.handleIntent(intent)
+        sessionController.start()
     }
 
-    override fun onNewIntent(intent: Intent?) {
+    override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleIntent(intent)
+        Log.i(TAG, "onNewIntent")
+        sessionController.handleIntent(intent)
     }
 
-    private fun handleIntent(intent: Intent?) {
-        intent?.let {
-            if (it.hasExtra("SESSION_ACTION")) {
-                val action = it.getStringExtra("SESSION_ACTION")
-                if (action == "START") {
-                    inSession = true
-                    sessionSeconds = 0
-                    sessionDurationMinutes = it.getIntExtra("DURATION", 30)
-                    sessionPackage = it.getStringExtra("PACKAGE")
-                    fiveMinsWarned = false
-                    
-                    statusText.text = "STATUS: IN SESSION"
-                    statusText.setTextColor(Color.parseColor("#3B82F6"))
-                    
-                    // Launch the game if package is provided
-                    sessionPackage?.let { pkg ->
-                        try {
-                            val launchIntent = packageManager.getLaunchIntentForPackage(pkg)
-                            if (launchIntent != null) {
-                                startActivity(launchIntent)
-                            } else {
-                                Toast.makeText(this, "App not found: $pkg", Toast.LENGTH_SHORT).show()
-                            }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-                    }
-                } else if (action == "STOP") {
-                    inSession = false
-                    sessionSeconds = 0
-                    fiveMinsWarned = false
-                    statusText.text = "STATUS: WAITING FOR SESSION"
-                    statusText.setTextColor(Color.parseColor("#10B981"))
-                    timerText.text = "00:00"
+    override fun launchGame(packageName: String?, activityName: String?) {
+        if (!QuestAppLauncher.launchGame(this, packageName, activityName)) {
+            Toast.makeText(this, "Не удалось запустить игру", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onSessionFinished(packageName: String?) {
+        QuestAppLauncher.killBackgroundProcesses(this, packageName)
+    }
+
+    override fun openLauncher() {
+        QuestAppLauncher.bringToFront(this, MainActivity::class.java)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        sessionController.stop()
+    }
+
+    private fun observeLauncherState() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
+                sessionController.uiState.collect { uiState ->
+                    render(uiState)
                 }
             }
         }
     }
-    
+
+    private fun render(uiState: LauncherUiState) {
+        binding.pairingIdText.text = "ID: ${uiState.pairingId}"
+        binding.mainStatusText.text = uiState.transientBanner ?: uiState.statusText
+        binding.mainStatusText.setTextColor(
+            when {
+                uiState.transientBanner != null ->
+                    ContextCompat.getColor(this, R.color.vr_danger)
+                else ->
+                    ContextCompat.getColor(this, R.color.vr_text_main)
+            }
+        )
+        binding.mainDescText.text = uiState.descriptionText
+        binding.timerText.text = uiState.timerText
+        binding.timerText.setTextColor(
+            ContextCompat.getColor(
+                this,
+                when (uiState.timerTone) {
+                    TimerTone.DEFAULT -> R.color.vr_text_main
+                    TimerTone.WARNING -> R.color.vr_warning
+                    TimerTone.DANGER -> R.color.vr_danger
+                }
+            )
+        )
+        binding.bottomActions.visibility = if (uiState.showBottomActions) View.VISIBLE else View.GONE
+        binding.wifiStatus.text = uiState.wifiStatus
+        binding.agentStatus.text = uiState.agentStatus
+        binding.batteryStatus.text = uiState.batteryStatus
+    }
+
     private fun promptExitKiosk() {
         val input = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
@@ -202,123 +145,14 @@ class MainActivity : AppCompatActivity() {
             .setView(input)
             .setPositiveButton("OK") { _, _ ->
                 if (input.text.toString() == "1234") {
-                    try {
+                    runCatching {
                         stopLockTask()
                         isKioskMode = false
-                        kioskBtn.text = "ENTER KIOSK MODE"
-                    } catch (e: Exception) {
-                        e.printStackTrace()
+                        binding.kioskBtn.visibility = View.GONE
                     }
-                } else {
-                    Toast.makeText(this, "Incorrect PIN", Toast.LENGTH_SHORT).show()
                 }
             }
             .setNegativeButton("Cancel", null)
             .show()
-    }
-
-    private fun showFiveMinuteWarning() {
-        handler.post {
-            Toast.makeText(this, "SESSION ENDS IN 5 MINUTES!", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private fun endSessionAutomatically() {
-        inSession = false
-        sessionSeconds = 0
-        fiveMinsWarned = false
-        
-        statusText.text = "STATUS: WAITING FOR SESSION"
-        statusText.setTextColor(Color.parseColor("#10B981"))
-        timerText.text = "00:00"
-        
-        // Attempt to kill background process
-        sessionPackage?.let { pkg ->
-            try {
-                val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                am.killBackgroundProcesses(pkg)
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-        
-        // Bring launcher to front
-        val bringToFrontIntent = Intent(this, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-        }
-        startActivity(bringToFrontIntent)
-    }
-
-    private fun generatePairingId(): String {
-        return UUID.randomUUID().toString().substring(0, 6).uppercase()
-    }
-
-    private fun updateTimerDisplay() {
-        if (!inSession) return
-        val remaining = maxOf(0, (sessionDurationMinutes * 60) - sessionSeconds)
-        val minutes = remaining / 60
-        val seconds = remaining % 60
-        timerText.text = String.format("%02d:%02d", minutes, seconds)
-    }
-
-    private fun startHeartbeat() {
-        handler.post(heartbeatRunnable)
-    }
-
-    private fun sendHeartbeat() {
-        Thread {
-            try {
-                val hubIp = intent?.getStringExtra("HUB_IP") ?: "192.168.1.100"
-                val url = java.net.URL("http://$hubIp:3000/api/agent/heartbeat")
-                val conn = url.openConnection() as java.net.HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.doOutput = true
-                val json = "{\"pairing_id\":\"$pairingId\",\"in_session\":$inSession,\"session_seconds\":$sessionSeconds}"
-                conn.outputStream.write(json.toByteArray())
-                conn.responseCode
-                conn.disconnect()
-            } catch (e: Exception) {
-                // Ignore network errors in MVP
-            }
-        }.start()
-    }
-
-    private fun callOperator() {
-        statusText.text = "OPERATOR NOTIFIED"
-        statusText.setTextColor(Color.parseColor("#F59E0B"))
-        
-        Thread {
-            try {
-                val hubIp = intent?.getStringExtra("HUB_IP") ?: "192.168.1.100"
-                val url = java.net.URL("http://$hubIp:3000/api/agent/call_operator")
-                val conn = url.openConnection() as java.net.HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.doOutput = true
-                val json = "{\"pairing_id\":\"$pairingId\"}"
-                conn.outputStream.write(json.toByteArray())
-                conn.responseCode
-                conn.disconnect()
-            } catch (e: Exception) {
-                // Ignore network errors in MVP
-            }
-        }.start()
-
-        // Reset message after 5 seconds
-        handler.postDelayed({
-            if (inSession) {
-                statusText.text = "STATUS: IN SESSION"
-                statusText.setTextColor(Color.parseColor("#3B82F6"))
-            } else {
-                statusText.text = "STATUS: WAITING FOR SESSION"
-                statusText.setTextColor(Color.parseColor("#10B981"))
-            }
-        }, 5000)
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        handler.removeCallbacks(heartbeatRunnable)
     }
 }

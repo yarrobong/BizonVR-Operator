@@ -41,7 +41,7 @@ export function Layout() {
             <button className="w-full bg-[#3B82F6] hover:bg-blue-600 text-white font-bold py-3 text-xs uppercase tracking-widest">New Session</button>
           </div>
           <nav className="flex-1">
-            <Link to="/" className={`flex items-center px-6 py-4 ${location.pathname === '/' ? 'bg-[#1F242D] border-l-4 border-blue-500 text-white' : 'text-slate-400 hover:text-white hover:bg-[#1C2128]'}`}>
+            <Link to="/dashboard" className={`flex items-center px-6 py-4 ${location.pathname === '/dashboard' ? 'bg-[#1F242D] border-l-4 border-blue-500 text-white' : 'border-l-4 border-transparent text-slate-400 hover:text-white hover:bg-[#1C2128]'}`}>
               <span className="text-xs font-bold uppercase tracking-widest">Dashboard</span>
             </Link>
             <Link to="/map" className={`flex items-center px-6 py-4 ${location.pathname === '/map' ? 'bg-[#1F242D] border-l-4 border-blue-500 text-white' : 'border-l-4 border-transparent text-slate-400 hover:text-white hover:bg-[#1C2128]'}`}>

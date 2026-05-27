@@ -1,0 +1,267 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/vr_background"
+    tools:ignore="MissingDefaultResource">
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@drawable/bg_main" />
+
+    <!--
+        This is the actual 16:9 VR canvas.
+        If Meta Quest gives us a real landscape window, it fills the screen.
+        If Horizon OS opens the app in another shape, the UI stays 16:9 and letterboxes instead of breaking.
+    -->
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/stage16x9"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@android:color/transparent">
+
+        <androidx.constraintlayout.widget.ConstraintLayout
+            android:id="@+id/mainPanel"
+            android:layout_width="0dp"
+            android:layout_height="0dp"
+            android:background="@drawable/bg_card_glass"
+            android:paddingStart="40dp"
+            android:paddingTop="36dp"
+            android:paddingEnd="40dp"
+            android:paddingBottom="36dp"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintDimensionRatio="16:9"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintWidth_percent="0.94">
+
+            <LinearLayout
+                android:id="@+id/upperRow"
+                android:layout_width="0dp"
+                android:layout_height="64dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent">
+
+                <TextView
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:background="@drawable/bg_debug_pill"
+                    android:gravity="center"
+                    android:text="i"
+                    android:textColor="@color/vr_primary_cyan"
+                    android:textSize="28sp"
+                    android:textStyle="bold"
+                    tools:ignore="HardcodedText" />
+
+                <TextView
+                    android:id="@+id/appTitle"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_weight="1"
+                    android:singleLine="true"
+                    android:text="@string/title_waiting"
+                    android:textColor="@color/vr_primary_cyan"
+                    android:textSize="28sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/pairingIdText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="48dp"
+                    android:background="@drawable/bg_debug_pill"
+                    android:gravity="center"
+                    android:minWidth="120dp"
+                    android:paddingHorizontal="22dp"
+                    android:singleLine="true"
+                    android:text="ID: Q3-04"
+                    android:textColor="@color/vr_primary_cyan"
+                    android:textSize="22sp"
+                    android:textStyle="bold"
+                    tools:ignore="HardcodedText" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/centerContent"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:gravity="center"
+                android:orientation="vertical"
+                app:layout_constraintBottom_toTopOf="@+id/bottomActions"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toBottomOf="@+id/upperRow">
+
+                <TextView
+                    android:id="@+id/mainStatusText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:gravity="center"
+                    android:includeFontPadding="false"
+                    android:singleLine="true"
+                    android:text="@string/status_waiting"
+                    android:textColor="@color/vr_text_main"
+                    android:textSize="42sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/timerText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:fontFamily="monospace"
+                    android:gravity="center"
+                    android:includeFontPadding="false"
+                    android:letterSpacing="-0.04"
+                    android:singleLine="true"
+                    android:text="00:00"
+                    android:textColor="@color/vr_text_main"
+                    android:textSize="180sp"
+                    android:textStyle="bold"
+                    tools:ignore="HardcodedText" />
+
+                <TextView
+                    android:id="@+id/mainDescText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:gravity="center"
+                    android:singleLine="true"
+                    android:text="@string/desc_waiting"
+                    android:textColor="@color/vr_text_muted"
+                    android:textSize="24sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/bottomActions"
+                android:layout_width="0dp"
+                android:layout_height="88dp"
+                android:layout_marginStart="40dp"
+                android:layout_marginEnd="40dp"
+                android:layout_marginBottom="24dp"
+                android:gravity="center"
+                android:orientation="horizontal"
+                app:layout_constraintBottom_toTopOf="@+id/footer"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent">
+
+                <Button
+                    android:id="@+id/callOperatorBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_operator_red"
+                    android:singleLine="true"
+                    android:text="@string/btn_call_operator"
+                    android:textAllCaps="false"
+                    android:textColor="@color/vr_danger"
+                    android:textSize="22sp"
+                    android:textStyle="bold"
+                    app:backgroundTint="@null" />
+
+                <Button
+                    android:id="@+id/menuBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_marginStart="32dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_primary_cyan"
+                    android:singleLine="true"
+                    android:text="@string/btn_game_menu"
+                    android:textAllCaps="false"
+                    android:textColor="@color/vr_primary_cyan"
+                    android:textSize="22sp"
+                    android:textStyle="bold"
+                    app:backgroundTint="@null" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/footer"
+                android:layout_width="0dp"
+                android:layout_height="42dp"
+                android:gravity="center"
+                android:orientation="horizontal"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:singleLine="true"
+                    android:text="Quest 3 • Зона 2"
+                    android:textColor="@color/vr_text_muted"
+                    android:textSize="18sp"
+                    tools:ignore="HardcodedText" />
+
+                <View
+                    android:layout_width="1dp"
+                    android:layout_height="22dp"
+                    android:layout_marginHorizontal="28dp"
+                    android:background="@color/vr_text_muted" />
+
+                <TextView
+                    android:id="@+id/wifiStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:singleLine="true"
+                    android:text="Wi-Fi: OK"
+                    android:textColor="@color/vr_success"
+                    android:textSize="18sp"
+                    tools:ignore="HardcodedText" />
+
+                <View
+                    android:layout_width="1dp"
+                    android:layout_height="22dp"
+                    android:layout_marginHorizontal="28dp"
+                    android:background="@color/vr_text_muted" />
+
+                <TextView
+                    android:id="@+id/agentStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:singleLine="true"
+                    android:text="Agent: online"
+                    android:textColor="@color/vr_success"
+                    android:textSize="18sp"
+                    tools:ignore="HardcodedText" />
+
+                <View
+                    android:layout_width="1dp"
+                    android:layout_height="22dp"
+                    android:layout_marginHorizontal="28dp"
+                    android:background="@color/vr_text_muted" />
+
+                <TextView
+                    android:id="@+id/batteryStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:singleLine="true"
+                    android:text="Battery: 84%"
+                    android:textColor="@color/vr_success"
+                    android:textSize="18sp"
+                    tools:ignore="HardcodedText" />
+            </LinearLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <Button
+        android:id="@+id/kioskBtn"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:background="@android:color/transparent"
+        android:text="@string/btn_exit_kiosk"
+        android:textAllCaps="false"
+        android:textColor="@color/vr_text_muted"
+        android:textSize="12sp"
+        android:visibility="gone" />
+</FrameLayout>

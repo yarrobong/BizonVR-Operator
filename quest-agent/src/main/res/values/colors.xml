@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="vr_background">#05070D</color>
+    <color name="vr_surface">#D10F172A</color> <!-- rgba(15, 23, 42, 0.82) -->
+    <color name="vr_surface_elevated">#111827</color>
+
+    <color name="vr_primary_cyan">#00E5FF</color>
+    <color name="vr_blue">#2563EB</color>
+    <color name="vr_success">#22C55E</color>
+    <color name="vr_warning">#F59E0B</color>
+    <color name="vr_danger">#EF4444</color>
+
+    <color name="vr_text_main">#F9FAFB</color>
+    <color name="vr_text_muted">#9CA3AF</color>
+
+    <color name="vr_glass_stroke">#4000E5FF</color>
+    <color name="vr_cyan_glow">#2600E5FF</color>
+    <color name="vr_red_glow">#26EF4444</color>
+</resources>

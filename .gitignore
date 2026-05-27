@@ -2,7 +2,20 @@ node_modules/
 build/
 dist/
 coverage/
+.cache/
 .DS_Store
 *.log
 .env*
 !.env.example
+
+# Android / Gradle
+.gradle/
+local.properties
+quest-agent/build/
+quest-agent/.gradle/
+quest-agent/local.properties
+
+# IDE
+.idea/
+quest-agent/.idea/
+.vscode/

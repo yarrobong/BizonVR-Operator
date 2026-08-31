@@ -2268,7 +2268,6 @@ function runCommandOnce(deviceSerial, commandType, payloadStr, commandMeta = {})
      let payload = {};
      try { payload = typeof payloadStr === 'string' ? JSON.parse(payloadStr || '{}') : (payloadStr || {}); } catch(e) {}
      const { stableSerial, selectedRoute } = await resolveRouteForCommand(deviceSerial, commandType, payload);
-     rememberAgentCredential(stableSerial, payload);
      const adbRoute = selectedRoute;
 
      if (!['RECONNECT_ADB', 'FORGET_DEVICE', 'RUN_DIAGNOSTICS'].includes(commandType) && !adbRoute) {
@@ -3121,13 +3120,17 @@ async function shutdownLocalHub(signal) {
 process.once('SIGTERM', () => { void shutdownLocalHub('SIGTERM').finally(() => { process.exitCode = 0; }); });
 process.once('SIGINT', () => { void shutdownLocalHub('SIGINT').finally(() => { process.exitCode = 0; }); });
 
-localServer.listen(LOCAL_SERVER_PORT, '0.0.0.0', () => {
-    console.log(`[Local Hub Mini-Server] Listening for Agent heartbeats on port ${LOCAL_SERVER_PORT}`);
+export { runCommandOnce };
 
-    // Start polling only after the local callback server is ready so Agent reverse
-    // tunnels and heartbeat posts have a live target immediately.
-    bootstrapKnownDevices().finally(() => {
-        syncPollTimer = setInterval(syncWithCloud, POLL_INTERVAL_MS);
-        syncWithCloud();
+if (process.env.LOCAL_HUB_DISABLE_AUTOSTART !== '1') {
+    localServer.listen(LOCAL_SERVER_PORT, '0.0.0.0', () => {
+        console.log(`[Local Hub Mini-Server] Listening for Agent heartbeats on port ${LOCAL_SERVER_PORT}`);
+
+        // Start polling only after the local callback server is ready so Agent reverse
+        // tunnels and heartbeat posts have a live target immediately.
+        bootstrapKnownDevices().finally(() => {
+            syncPollTimer = setInterval(syncWithCloud, POLL_INTERVAL_MS);
+            syncWithCloud();
+        });
     });
-});
+}

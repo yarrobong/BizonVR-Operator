@@ -15,6 +15,7 @@ import {
   createSubscriptionPlan,
   createUser,
   createSession,
+  assignDeviceToRoom,
   finishActiveSessionForDevice,
   getActiveSessionForDevice,
   getPermissionActor,
@@ -30,7 +31,12 @@ import {
   dismissHelpRequest,
   updateCommandStatus,
   upsertDeviceApp,
+  verifyAgentCredential,
+  listClubs,
+  listLocalHubs,
+  listRooms,
 } from "../src/backend/database";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1037,5 +1043,111 @@ describe("BizonVR Backend Logic Tests", () => {
     const logs = listAuditLogs(db) as Array<any>;
     assert.ok(logs.some((log) => log.action === "session.created" && log.entity_id === String(sessionId)));
     assert.ok(logs.some((log) => log.action === "device_command.created"));
+  });
+
+  it("binds Agent credentials to one Quest and never exposes the stored credential", () => {
+    const { db, deviceId, actor } = createReadyFixture();
+    const token = "test-agent-credential-only-in-memory";
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    db.prepare(`UPDATE devices SET agent_token_hash = ? WHERE id = ?`).run(tokenHash, deviceId);
+    const device = (listDevices(db, actor) as Array<any>)[0];
+    assert.equal(verifyAgentCredential(db, { pairingId: device.pairing_id, stableId: device.stable_id }, token)?.id, deviceId);
+    assert.equal(verifyAgentCredential(db, { pairingId: device.pairing_id, stableId: device.stable_id }, "wrong-token"), null);
+    assert.equal(verifyAgentCredential(db, { pairingId: device.pairing_id, stableId: "OTHER-QUEST" }, token), null);
+    assert.equal(Object.prototype.hasOwnProperty.call(device, "agent_token_hash"), false);
+  });
+
+  it("keeps Agent provisioning credentials out of Cloud command and result storage", () => {
+    const rawToken = "test-agent-credential-never-persisted";
+    const validHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+    const createProvisioningCommand = () => {
+      const fixture = createReadyFixture({ role: "technician" });
+      const commandId = createDeviceCommand(fixture.db, {
+        deviceId: fixture.deviceId,
+        localHubId: fixture.hubId,
+        type: "INSTALL_APK",
+        actor: fixture.actor,
+        payload: {
+          target: "quest_agent",
+          artifact_id: "quest-agent-1",
+          apk_checksum: "a".repeat(64),
+          rotate_agent_credential: true,
+          pairing_id: "PAIRING-1",
+        },
+      });
+      const row = fixture.db.prepare(`SELECT payload FROM device_commands WHERE id = ?`).get(commandId) as { payload: string };
+      assert.match(row.payload, /rotate_agent_credential/);
+      assert.match(row.payload, /artifact_id/);
+      assert.doesNotMatch(row.payload, /agent_token/);
+      return { ...fixture, commandId };
+    };
+    const advanceToRunning = (db: any, commandId: number) => {
+      updateCommandStatus(db, commandId, "accepted_by_hub");
+      updateCommandStatus(db, commandId, "running");
+    };
+
+    const successful = createProvisioningCommand();
+    advanceToRunning(successful.db, successful.commandId);
+    updateCommandStatus(successful.db, successful.commandId, "succeeded", null, { result: { success: true, agent_token_hash: validHash } });
+    assert.equal((successful.db.prepare(`SELECT agent_token_hash FROM devices WHERE id = ?`).get(successful.deviceId) as { agent_token_hash: string }).agent_token_hash, validHash);
+
+    const failed = createProvisioningCommand();
+    const oldHash = "b".repeat(64);
+    failed.db.prepare(`UPDATE devices SET agent_token_hash = ? WHERE id = ?`).run(oldHash, failed.deviceId);
+    advanceToRunning(failed.db, failed.commandId);
+    updateCommandStatus(failed.db, failed.commandId, "failed", "install failed", { result: { success: false } });
+    assert.equal((failed.db.prepare(`SELECT agent_token_hash FROM devices WHERE id = ?`).get(failed.deviceId) as { agent_token_hash: string }).agent_token_hash, oldHash);
+
+    const invalidHash = createProvisioningCommand();
+    advanceToRunning(invalidHash.db, invalidHash.commandId);
+    assert.throws(() => updateCommandStatus(invalidHash.db, invalidHash.commandId, "succeeded", null, { result: { success: true, agent_token_hash: "not-a-sha256" } }), /valid SHA-256/);
+    assert.equal((invalidHash.db.prepare(`SELECT result_json, agent_token_hash FROM device_commands JOIN devices ON devices.id = device_commands.device_id WHERE device_commands.id = ?`).get(invalidHash.commandId) as { result_json: string | null; agent_token_hash: string | null }).result_json, null);
+
+    const arbitrary = createReadyFixture();
+    const arbitraryCommandId = createDeviceCommand(arbitrary.db, { deviceId: arbitrary.deviceId, localHubId: arbitrary.hubId, type: "REFRESH_STATUS", actor: arbitrary.actor, payload: { reason: "status" } });
+    advanceToRunning(arbitrary.db, arbitraryCommandId);
+    updateCommandStatus(arbitrary.db, arbitraryCommandId, "succeeded", null, { result: { success: true, agent_token_hash: validHash } });
+    assert.equal((arbitrary.db.prepare(`SELECT agent_token_hash FROM devices WHERE id = ?`).get(arbitrary.deviceId) as { agent_token_hash: string | null }).agent_token_hash, null);
+
+    const rawResult = createProvisioningCommand();
+    advanceToRunning(rawResult.db, rawResult.commandId);
+    assert.throws(() => updateCommandStatus(rawResult.db, rawResult.commandId, "failed", "rejected", { result: { success: false, agent_token: rawToken } }), /Raw credential field/);
+    const persisted = JSON.stringify(rawResult.db.prepare(`SELECT payload, result_json FROM device_commands`).all()) + JSON.stringify(rawResult.db.prepare(`SELECT details FROM audit_logs`).all());
+    assert.doesNotMatch(persisted, new RegExp(rawToken));
+  });
+
+  it("filters every operator collection by authenticated organization and club scope", () => {
+    const { db, actor } = createReadyFixture();
+    const otherOrganizationId = createOrganization(db, { name: "Other Org", slug: `other-${Math.random()}` });
+    const otherClubId = createClub(db, { organizationId: otherOrganizationId, name: "Other Club", slug: `other-club-${Math.random()}` });
+    const otherRoomId = createClubRoom(db, { clubId: otherClubId, name: "Other Room", slug: `other-room-${Math.random()}` });
+    const otherHubId = createLocalHub(db, { clubId: otherClubId, name: "Other Hub" });
+    const otherDeviceId = createDevice(db, { clubId: otherClubId, roomId: otherRoomId, localHubId: otherHubId, name: "Other Quest", serialNumber: `OTHER-${Math.random()}` });
+    createDeviceCommand(db, { deviceId: otherDeviceId, localHubId: otherHubId, type: "REFRESH_STATUS" });
+    assert.equal((listClubs(db, actor) as Array<any>).some((row) => row.id === otherClubId), false);
+    assert.equal((listRooms(db, actor) as Array<any>).some((row) => row.id === otherRoomId), false);
+    assert.equal((listLocalHubs(db, actor) as Array<any>).some((row) => row.id === otherHubId), false);
+    assert.equal((listDevices(db, actor) as Array<any>).some((row) => row.id === otherDeviceId), false);
+    assert.equal((listCommands(db, actor) as Array<any>).some((row) => row.device_id === otherDeviceId), false);
+    assert.equal((listAuditLogs(db, actor) as Array<any>).some((row) => row.club_id === otherClubId), false);
+    assert.throws(() => createDeviceCommand(db, { deviceId: otherDeviceId, localHubId: otherHubId, type: "REFRESH_STATUS", actor }), /organization scope mismatch/);
+    assert.throws(() => assignDeviceToRoom(db, otherDeviceId, otherRoomId, actor), /organization scope mismatch/);
+  });
+
+  it("does not refresh Agent state from an old heartbeat", () => {
+    const { db, hubId, deviceId } = createReadyFixture();
+    const device = (listDevices(db) as Array<any>).find((row) => row.id === deviceId) as any;
+    db.prepare(`UPDATE devices SET agent_status = 'offline', last_heartbeat_at = NULL WHERE id = ?`).run(deviceId);
+    syncHubState(db, hubId, {
+      agent_heartbeats: [{
+        stable_id: device.stable_id,
+        pairing_id: device.pairing_id,
+        timestamp: Date.now() - 120_000,
+        in_session: false,
+      }],
+    });
+    const after = (listDevices(db) as Array<any>).find((row) => row.id === deviceId) as any;
+    assert.equal(after.agent_status, "offline");
+    assert.equal(after.last_heartbeat_at, null);
   });
 });

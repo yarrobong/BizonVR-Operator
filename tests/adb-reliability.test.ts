@@ -86,6 +86,32 @@ describe("ADB process runner", () => {
       fake.cleanup();
     }
   });
+
+  it("fails safely when stdout exceeds the configured bound", async () => {
+    const fake = createFakeAdbState({ commands: { "large": { stdout: "x".repeat(4096) } } });
+    try {
+      const runner = createAdbProcessRunner({ executable: fake.executable, prefixArgs: fake.prefixArgs, defaultTimeoutMs: 500 });
+      const result = await runner.run(["large"], { maxStdoutBytes: 128, spawnOptions: fake.spawnOptions });
+      assert.equal(result.ok, false);
+      assert.equal(result.outputLimitExceeded, true);
+      assert.equal(result.errorCode, "OUTPUT_LIMIT_EXCEEDED");
+      assert.equal(runner.getActiveCount(), 0);
+    } finally {
+      fake.cleanup();
+    }
+  });
+
+  it("preserves binary stdout for bounded screencap capture", async () => {
+    const fake = createFakeAdbState({ commands: { "binary": { stdout: "\u0000\u0080\u00ff\u0001" } } });
+    try {
+      const runner = createAdbProcessRunner({ executable: fake.executable, prefixArgs: fake.prefixArgs, defaultTimeoutMs: 500 });
+      const result = await runner.run(["binary"], { encoding: "buffer", spawnOptions: fake.spawnOptions });
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.stdout, Buffer.from([0x00, 0xc2, 0x80, 0xc3, 0xbf, 0x01]));
+    } finally {
+      fake.cleanup();
+    }
+  });
 });
 
 describe("ADB command recovery", () => {

@@ -8,19 +8,15 @@ import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.util.Log
-import java.net.Inet4Address
-import java.net.NetworkInterface
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.UUID
@@ -42,6 +38,7 @@ class SpatialSessionController(
     private val persistedHubIp = preferences.getString(KEY_HUB_IP, "") ?: ""
     private val persistedHubPort = preferences.getInt(KEY_HUB_PORT, DEFAULT_HUB_PORT)
     private val agentId = getOrCreateAgentId()
+    private var agentToken = preferences.getString(KEY_AGENT_TOKEN, "") ?: ""
     private var lastHeartbeatSentAt = 0L
     private var lastResolvedLocalIp: String? = preferences.getString(KEY_LAST_KNOWN_LOCAL_IP, null)?.takeIf { it.isNotBlank() }
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -291,7 +288,7 @@ class SpatialSessionController(
 
     fun callOperator() {
         val state = _uiState.value
-        heartbeatClient.callOperator(state.pairingId, state.hubIp, state.hubPort)
+        heartbeatClient.callOperator(state.pairingId, agentToken, state.hubIp, state.hubPort)
         showTransientBanner("ОПЕРАТОР ВЫЗВАН")
     }
 
@@ -327,6 +324,10 @@ class SpatialSessionController(
             .putString(KEY_HUB_IP, nextHubIp)
             .putInt(KEY_HUB_PORT, nextHubPort)
             .apply()
+        intent.getStringExtra(EXTRA_AGENT_TOKEN)?.takeIf { it.isNotBlank() }?.let {
+            agentToken = it
+            preferences.edit().putString(KEY_AGENT_TOKEN, it).apply()
+        }
         _uiState.value =
             _uiState.value.copy(
                 hubIp = nextHubIp,
@@ -383,6 +384,7 @@ class SpatialSessionController(
         val state = _uiState.value
         heartbeatClient.sendHeartbeat(
             HeartbeatSnapshot(
+                agentToken = agentToken,
                 pairingId = state.pairingId,
                 agentId = agentId,
                 androidId = currentAndroidId(),
@@ -724,85 +726,13 @@ class SpatialSessionController(
     }
 
     private fun currentLocalIp(): String? {
-        runCatching {
-            val wifiManager = appContext.getSystemService(WifiManager::class.java)
-            val wifiIp = wifiManager?.connectionInfo?.ipAddress ?: 0
-            if (wifiIp != 0) {
-                val resolvedWifiIp = formatIpv4FromInt(wifiIp)
-                if (resolvedWifiIp.isNotBlank() && resolvedWifiIp != "0.0.0.0") {
-                    return resolvedWifiIp
-                }
-            }
-        }.onFailure { error ->
-            Log.w(TAG, "WifiManager local_ip lookup failed: ${error.message}")
-        }
-
         val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java) ?: return null
         val activeNetwork = connectivityManager.activeNetwork
-        val allNetworks = connectivityManager.allNetworks.toList()
-        val wifiNetworks = allNetworks.filter { network ->
-            val caps = connectivityManager.getNetworkCapabilities(network) ?: return@filter false
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
-        }
-
-        val candidateNetworks = buildList {
-            if (activeNetwork != null) {
-                add(activeNetwork)
-            }
-            addAll(wifiNetworks.filter { it != activeNetwork })
-            addAll(allNetworks.filter { it != activeNetwork && !wifiNetworks.contains(it) })
-        }
-
-        for (network in candidateNetworks) {
-            val linkProperties = connectivityManager.getLinkProperties(network) ?: continue
-            val networkCapabilities = connectivityManager.getNetworkCapabilities(network)
-            val interfaceName = linkProperties.interfaceName.orEmpty()
-            val ipv4 = linkProperties.linkAddresses
-                .mapNotNull { it.address }
-                .filterIsInstance<Inet4Address>()
-                .firstOrNull { address ->
-                    !address.isLoopbackAddress &&
-                        !address.isLinkLocalAddress &&
-                        !address.hostAddress.orEmpty().startsWith("127.")
-                }
-
-            val isWifiCandidate = networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-            val isVpnTransport = networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
-            if (ipv4 != null && !isVpnTransport && (isWifiCandidate || interfaceName.startsWith("wlan"))) {
-                return ipv4.hostAddress
-            }
-        }
-
-        val wlanFallback = Collections.list(NetworkInterface.getNetworkInterfaces())
-            .firstOrNull { networkInterface ->
-                networkInterface.isUp && !networkInterface.isLoopback && networkInterface.name.startsWith("wlan")
-            }
-            ?.inetAddresses
-            ?.toList()
-            ?.filterIsInstance<Inet4Address>()
-            ?.firstOrNull { address ->
-                !address.isLoopbackAddress &&
-                    !address.isLinkLocalAddress &&
-                    !address.hostAddress.orEmpty().startsWith("127.")
-            }
-            ?.hostAddress
-
-        if (!wlanFallback.isNullOrBlank()) {
-            Log.i(TAG, "Resolved active Wi-Fi local_ip from wlan fallback=$wlanFallback")
-            return wlanFallback
-        }
-
-        Log.w(TAG, "Could not resolve IPv4 local_ip from active Wi-Fi network")
-        return null
-    }
-
-    private fun formatIpv4FromInt(ip: Int): String {
-        return listOf(
-            ip and 0xff,
-            ip shr 8 and 0xff,
-            ip shr 16 and 0xff,
-            ip shr 24 and 0xff
-        ).joinToString(".")
+        if (activeNetwork == null) return null
+        val caps = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return null
+        if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return null
+        val linkProperties = connectivityManager.getLinkProperties(activeNetwork) ?: return null
+        return selectActiveWifiIpv4(linkProperties.linkAddresses.mapNotNull { it.address.hostAddress })
     }
 
     private fun updateLocalIpAndHeartbeat() {
@@ -864,6 +794,7 @@ class SpatialSessionController(
 
         private const val KEY_PAIRING_ID = "pairing_id"
         private const val KEY_AGENT_ID = "agent_id"
+        private const val KEY_AGENT_TOKEN = "agent_token"
         private const val KEY_HUB_IP = "hub_ip"
         private const val KEY_HUB_PORT = "hub_port"
         private const val KEY_LAST_SUCCESSFUL_HEARTBEAT_AT = "last_successful_heartbeat_at"
@@ -897,6 +828,7 @@ class SpatialSessionController(
         private const val EXTRA_MESSAGE = "MESSAGE"
         private const val EXTRA_SESSION_ID = "SESSION_ID"
         private const val EXTRA_SESSION_REVISION = "SESSION_REVISION"
+        private const val EXTRA_AGENT_TOKEN = "AGENT_TOKEN"
 
         private const val ACTION_START = "START"
         private const val ACTION_RESUME = "RESUME"

@@ -21,10 +21,14 @@ import {
   listRooms,
   listSessions,
   markOperatorCall,
+  pauseSession,
+  resumeSession,
   seedDemoData,
+  switchSessionApp,
   syncHubState,
   updateCommandStatus,
 } from "./src/backend/database";
+import { buildCastResponse as buildCastResponsePayload } from "./src/backend/cast";
 
 const app = express();
 const PORT = 3000;
@@ -112,84 +116,12 @@ app.get("/api/devices", (_req, res) => {
   res.json(listDevices(db));
 });
 
-function buildCastResponse(deviceId: number) {
-  const device = listDevices(db).find((item: any) => item.id === deviceId);
-  if (!device) {
-    return { status: 404, body: { error: "Device not found" } };
-  }
-  if (!device.local_hub_id) {
-    return {
-      status: 409,
-      body: {
-        error: "No Local Hub assigned to this device",
-        next_step: "Assign the headset to an online Local Hub before opening the cast.",
-      },
-    };
-  }
-  const canWakeOverWifi = Boolean(device.wake_supported || device.wifi_ip);
-  if (device.status === "offline" && !canWakeOverWifi) {
-    return {
-      status: 409,
-      body: {
-        error: "Device is offline",
-        next_step: "Reconnect the Quest through Local Hub and ADB before opening the cast.",
-      },
-    };
-  }
-  if (device.adb_status !== "online") {
-    return {
-      status: 409,
-      body: {
-        error: `ADB is ${String(device.adb_status || "offline").replace(/_/g, " ")}`,
-        state: "partial_offline",
-        next_step: String(device.next_operator_step || "Wait for Local Hub to restore ADB, or run USB Repair before opening the cast."),
-      },
-    };
-  }
-
-  const hub = listLocalHubs(db).find((item: any) => item.id === Number(device.local_hub_id)) as
+function getCastResult(deviceId: number, options?: { transport?: string | null; profile?: string | null }) {
+  const device = listDevices(db).find((item: any) => item.id === deviceId) as Record<string, unknown> | undefined;
+  const hub = listLocalHubs(db).find((item: any) => item.id === Number(device?.local_hub_id)) as
     | { id: number; name: string; status: string; host: string | null }
     | undefined;
-  if (!hub) {
-    return {
-      status: 404,
-      body: {
-        error: "Local Hub not found",
-        next_step: "Reconnect the branch Local Hub and try again.",
-      },
-    };
-  }
-  if (hub.status !== "online" || !hub.host) {
-    return {
-      status: 409,
-      body: {
-        error: "Local Hub is offline",
-        next_step: "Bring the Local Hub online so the operator can open the device cast in the panel.",
-      },
-    };
-  }
-
-  return {
-    status: 200,
-    body: {
-      success: true,
-      device: {
-        id: device.id,
-        name: device.name,
-        status: device.status,
-        serial_number: device.serial_number,
-      },
-      hub: {
-        id: hub.id,
-        name: hub.name,
-        status: hub.status,
-        host: hub.host,
-        port: LOCAL_HUB_STREAM_PORT,
-      },
-      stream_url: `http://${hub.host}:${LOCAL_HUB_STREAM_PORT}/streams/${encodeURIComponent(String(device.serial_number))}?transport=mpjpeg&ts=${Date.now()}`,
-      wake_on_open: canWakeOverWifi,
-    },
-  };
+  return buildCastResponsePayload(device as any, hub, LOCAL_HUB_STREAM_PORT, options);
 }
 
 function buildHealthCheck(device: any) {
@@ -241,7 +173,10 @@ function buildHealthCheck(device: any) {
 }
 
 app.get("/api/devices/:id/cast", (req, res) => {
-  const result = buildCastResponse(Number(req.params.id));
+  const result = getCastResult(Number(req.params.id), {
+    transport: typeof req.query.transport === "string" ? req.query.transport : null,
+    profile: typeof req.query.profile === "string" ? req.query.profile : null,
+  });
   return res.status(result.status).json(result.body);
 });
 
@@ -423,7 +358,7 @@ app.delete("/api/devices/:id", (req, res) => {
 });
 
 app.post("/api/devices/:id/scrcpy", (req, res) => {
-  const result = buildCastResponse(Number(req.params.id));
+  const result = getCastResult(Number(req.params.id));
   return res.status(result.status).json({
     ...result.body,
     legacy_endpoint: true,
@@ -568,6 +503,42 @@ app.post("/api/sessions/:device_id/stop", (req, res) => {
     const deviceId = Number(req.params.device_id);
     const sessionId = finishActiveSessionForDevice(db, deviceId, getRequestActor(req));
     return res.json({ success: Boolean(sessionId), session_id: sessionId });
+  } catch (error) {
+    return handleApiError(res, error);
+  }
+});
+
+app.post("/api/sessions/:id/pause", (req, res) => {
+  try {
+    const summary = pauseSession(db, Number(req.params.id), getRequestActor(req));
+    return res.json({ success: true, session: summary });
+  } catch (error) {
+    return handleApiError(res, error);
+  }
+});
+
+app.post("/api/sessions/:id/resume", (req, res) => {
+  try {
+    const summary = resumeSession(db, Number(req.params.id), getRequestActor(req));
+    return res.json({ success: true, session: summary });
+  } catch (error) {
+    return handleApiError(res, error);
+  }
+});
+
+app.post("/api/sessions/:id/switch-app", (req, res) => {
+  const { app_package, app_activity } = req.body ?? {};
+  if (!app_package) {
+    return res.status(400).json({ error: "app_package is required" });
+  }
+
+  try {
+    const summary = switchSessionApp(db, Number(req.params.id), {
+      appPackage: String(app_package),
+      appActivity: app_activity ? String(app_activity) : undefined,
+      actor: getRequestActor(req),
+    });
+    return res.json({ success: true, session: summary });
   } catch (error) {
     return handleApiError(res, error);
   }

@@ -135,7 +135,7 @@ export function createAdbSupervisor({
         if (!verifiedIdentity?.matched) {
           await adbDisconnect(serial);
           updateState(stableSerial, {
-            status: 'offline',
+            status: 'different_device',
             lastError: verifiedIdentity?.message || `ADB route ${serial} did not match the expected Quest identity.`,
           });
           continue;

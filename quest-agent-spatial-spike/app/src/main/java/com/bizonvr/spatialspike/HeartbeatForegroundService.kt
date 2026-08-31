@@ -24,11 +24,8 @@ class HeartbeatForegroundService : Service() {
                 override fun launchGame(packageName: String?, activityName: String?) {}
                 override fun onSessionFinished(packageName: String?) {}
                 override fun openLauncher() {
-                    val launcherIntent = Intent(this@HeartbeatForegroundService, SpatialSpikeActivity::class.java)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    startActivity(launcherIntent)
+                    QuestAppLauncher.launchAgentUi(this@HeartbeatForegroundService)
                 }
-                override fun openGameMenu() {}
             }).also { it.start(heartbeatOwner = true) }
         } else {
             Log.i(TAG, "Heartbeat foreground service already owns the heartbeat loop")

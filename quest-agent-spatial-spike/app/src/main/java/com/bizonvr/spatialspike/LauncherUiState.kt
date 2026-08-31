@@ -1,5 +1,12 @@
 package com.bizonvr.spatialspike
 
+data class LauncherGameEntry(
+    val packageName: String,
+    val displayName: String,
+    val activityName: String? = null,
+    val isCurrentSessionApp: Boolean = false
+)
+
 data class LauncherUiState(
     val pairingId: String,
     val launcherState: LauncherState = LauncherState.WAITING,
@@ -9,9 +16,12 @@ data class LauncherUiState(
     val timerTone: TimerTone = TimerTone.DEFAULT,
     val showBottomActions: Boolean = true,
     val inSession: Boolean = false,
+    val sessionPaused: Boolean = false,
     val sessionSeconds: Int = 0,
+    val sessionRemainingSeconds: Int = 0,
     val sessionDurationMinutes: Int = 30,
     val sessionPackage: String? = null,
+    val sessionAppName: String? = null,
     val sessionActivity: String? = null,
     val hubIp: String = "",
     val hubPort: Int = 3001,
@@ -19,5 +29,8 @@ data class LauncherUiState(
     val footerLine: String = "Quest 3 • Zone 2",
     val wifiStatus: String = "Wi-Fi OK",
     val agentStatus: String = "Agent online",
-    val batteryStatus: String = "Battery --%"
+    val batteryStatus: String = "Battery --%",
+    val gameMenuVisible: Boolean = false,
+    val availableGames: List<LauncherGameEntry> = emptyList(),
+    val gameMenuStatusText: String = "Загрузка списка игр…"
 )

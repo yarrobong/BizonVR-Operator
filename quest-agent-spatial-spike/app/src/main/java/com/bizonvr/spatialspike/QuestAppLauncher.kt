@@ -6,6 +6,22 @@ import android.content.Context
 import android.content.Intent
 
 object QuestAppLauncher {
+    fun launchAgentUi(context: Context): Boolean {
+        return runCatching {
+            val launchIntent =
+                context.packageManager.getLaunchIntentForPackage(context.packageName)
+                    ?.apply {
+                        addCategory("com.oculus.intent.category.VR")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                    }
+
+            launchIntent?.let {
+                context.startActivity(it)
+                true
+            } ?: false
+        }.getOrDefault(false)
+    }
+
     fun launchGame(context: Context, packageName: String?, activityName: String?): Boolean {
         packageName ?: return false
 
@@ -38,6 +54,10 @@ object QuestAppLauncher {
     }
 
     fun bringToFront(context: Context, activityClass: Class<*>) {
+        if (activityClass.name == SpatialSpikeActivity::class.java.name && launchAgentUi(context)) {
+            return
+        }
+
         val intent =
             Intent(context, activityClass).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)

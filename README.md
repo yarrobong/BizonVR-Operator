@@ -23,7 +23,7 @@ scrcpy -b 25M --max-size=1600 --crop=1600:1000:116:460 --no-audio
 
 - The backend uses port \`3000\`.
 - The Local Hub mini-server should use \`3001\` locally so it does not conflict with the backend.
-- When the Quest Agent is launched by Local Hub, the hub passes its IP and port to the headset automatically.
+- When the Quest Agent is launched by Local Hub, the hub passes its IP and port to the headset automatically and opens the agent through the Quest VR launcher entry, not by directly starting the raw activity.
 - Device casting now opens inside the web operator panel. The browser requests the stream URL from the cloud API, then connects to the Local Hub mini-server on \`HUB_PORT\`.
 - To make \`INSTALL_APK\` work, first build the Android app so the APK exists at \`quest-agent-spatial-spike/app/build/outputs/apk/debug/app-debug.apk\`, or override \`QUEST_AGENT_APK_PATH\`.
 - To keep Quest control stable over Wi-Fi, enable \`ENABLE_WIRELESS_ADB=1\` on Local Hub after the first trusted USB connection. The hub caches the stable USB serial and reconnects to the remembered \`ip:5555\` route on later sync cycles.

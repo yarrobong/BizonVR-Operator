@@ -29,7 +29,6 @@ interface SpatialSessionCallbacks {
     fun launchGame(packageName: String?, activityName: String?)
     fun onSessionFinished(packageName: String?)
     fun openLauncher()
-    fun openGameMenu()
 }
 
 class SpatialSessionController(
@@ -92,20 +91,18 @@ class SpatialSessionController(
                 val snapshot = _uiState.value
                 _uiState.value = snapshot.copy(batteryStatus = currentBatteryStatus())
 
-                if (snapshot.inSession) {
-                    val nextSeconds = snapshot.sessionSeconds + HEARTBEAT_INTERVAL_SECONDS
-                    val totalSessionSeconds = snapshot.sessionDurationMinutes * 60
-                    val remainingSeconds = totalSessionSeconds - nextSeconds
+                if (snapshot.inSession && !snapshot.sessionPaused) {
+                    val nextRemainingSeconds = maxOf(0, snapshot.sessionRemainingSeconds - HEARTBEAT_INTERVAL_SECONDS)
 
                     when {
-                        remainingSeconds <= 0 -> endSessionAutomatically()
-                        remainingSeconds <= FIVE_MINUTES_SECONDS &&
+                        nextRemainingSeconds <= 0 -> endSessionAutomatically()
+                        nextRemainingSeconds <= FIVE_MINUTES_SECONDS &&
                             snapshot.launcherState != LauncherState.FIVE_MIN_WARN ->
                             transitionTo(
                                 launcherState = LauncherState.FIVE_MIN_WARN,
-                                timerSeconds = nextSeconds
+                                remainingSeconds = nextRemainingSeconds
                             )
-                        else -> updateTimer(nextSeconds)
+                        else -> updateTimer(nextRemainingSeconds)
                     }
                 }
 
@@ -120,20 +117,18 @@ class SpatialSessionController(
                 val snapshot = _uiState.value
                 _uiState.value = snapshot.copy(batteryStatus = currentBatteryStatus())
 
-                if (snapshot.inSession) {
-                    val nextSeconds = snapshot.sessionSeconds + UI_REFRESH_INTERVAL_SECONDS
-                    val totalSessionSeconds = snapshot.sessionDurationMinutes * 60
-                    val remainingSeconds = totalSessionSeconds - nextSeconds
+                if (snapshot.inSession && !snapshot.sessionPaused) {
+                    val nextRemainingSeconds = maxOf(0, snapshot.sessionRemainingSeconds - UI_REFRESH_INTERVAL_SECONDS)
 
                     when {
-                        remainingSeconds <= 0 -> endSessionAutomatically()
-                        remainingSeconds <= FIVE_MINUTES_SECONDS &&
+                        nextRemainingSeconds <= 0 -> endSessionAutomatically()
+                        nextRemainingSeconds <= FIVE_MINUTES_SECONDS &&
                             snapshot.launcherState != LauncherState.FIVE_MIN_WARN ->
                             transitionTo(
                                 launcherState = LauncherState.FIVE_MIN_WARN,
-                                timerSeconds = nextSeconds
+                                remainingSeconds = nextRemainingSeconds
                             )
-                        else -> updateTimer(nextSeconds)
+                        else -> updateTimer(nextRemainingSeconds)
                     }
                 }
 
@@ -177,12 +172,16 @@ class SpatialSessionController(
 
         when (intent.getStringExtra(EXTRA_SESSION_ACTION)) {
             ACTION_START -> {
+                val durationSeconds = resolveDurationSeconds(intent)
+                val remainingSeconds = resolveRemainingSeconds(intent, durationSeconds)
                 transitionTo(
                     launcherState = LauncherState.STARTING,
                     inSession = true,
-                    timerSeconds = 0,
-                    sessionDurationMinutes = intent.getIntExtra(EXTRA_DURATION, 30),
-                    sessionPackage = intent.getStringExtra(EXTRA_PACKAGE),
+                    sessionPaused = false,
+                    remainingSeconds = remainingSeconds,
+                    sessionDurationMinutes = maxOf(1, durationSeconds / 60),
+                    sessionPackage = intent.getStringExtra(EXTRA_CURRENT_APP_PACKAGE) ?: intent.getStringExtra(EXTRA_PACKAGE),
+                    sessionAppName = intent.getStringExtra(EXTRA_CURRENT_APP_NAME) ?: intent.getStringExtra(EXTRA_APP_NAME),
                     sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY)
                 )
 
@@ -194,11 +193,67 @@ class SpatialSessionController(
                 }, START_DELAY_MS)
             }
 
+            ACTION_RESUME -> {
+                val durationSeconds = resolveDurationSeconds(intent)
+                val remainingSeconds = resolveRemainingSeconds(intent, durationSeconds)
+                transitionTo(
+                    launcherState = if (remainingSeconds <= FIVE_MINUTES_SECONDS) LauncherState.FIVE_MIN_WARN else LauncherState.ACTIVE,
+                    inSession = true,
+                    sessionPaused = false,
+                    remainingSeconds = remainingSeconds,
+                    sessionDurationMinutes = maxOf(1, durationSeconds / 60),
+                    sessionPackage = intent.getStringExtra(EXTRA_CURRENT_APP_PACKAGE) ?: intent.getStringExtra(EXTRA_PACKAGE),
+                    sessionAppName = intent.getStringExtra(EXTRA_CURRENT_APP_NAME) ?: intent.getStringExtra(EXTRA_APP_NAME),
+                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY)
+                )
+            }
+
+            ACTION_PAUSE -> {
+                val durationSeconds = resolveDurationSeconds(intent)
+                val remainingSeconds = resolveRemainingSeconds(intent, durationSeconds)
+                transitionTo(
+                    launcherState = LauncherState.PAUSED,
+                    inSession = true,
+                    sessionPaused = true,
+                    remainingSeconds = remainingSeconds,
+                    sessionDurationMinutes = maxOf(1, durationSeconds / 60),
+                    sessionPackage = intent.getStringExtra(EXTRA_CURRENT_APP_PACKAGE) ?: intent.getStringExtra(EXTRA_PACKAGE),
+                    sessionAppName = intent.getStringExtra(EXTRA_CURRENT_APP_NAME) ?: intent.getStringExtra(EXTRA_APP_NAME),
+                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY)
+                )
+                callbacks.openLauncher()
+            }
+
+            ACTION_SWITCH, ACTION_SYNC -> {
+                val durationSeconds = resolveDurationSeconds(intent)
+                val remainingSeconds = resolveRemainingSeconds(intent, durationSeconds)
+                val paused = intent.getBooleanExtra(EXTRA_PAUSED, false) ||
+                    intent.getStringExtra(EXTRA_SESSION_STATUS) == "paused"
+                transitionTo(
+                    launcherState = when {
+                        paused -> LauncherState.PAUSED
+                        remainingSeconds <= FIVE_MINUTES_SECONDS -> LauncherState.FIVE_MIN_WARN
+                        else -> LauncherState.ACTIVE
+                    },
+                    inSession = true,
+                    sessionPaused = paused,
+                    remainingSeconds = remainingSeconds,
+                    sessionDurationMinutes = maxOf(1, durationSeconds / 60),
+                    sessionPackage = intent.getStringExtra(EXTRA_CURRENT_APP_PACKAGE) ?: intent.getStringExtra(EXTRA_PACKAGE),
+                    sessionAppName = intent.getStringExtra(EXTRA_CURRENT_APP_NAME) ?: intent.getStringExtra(EXTRA_APP_NAME),
+                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY)
+                )
+                if (paused) {
+                    callbacks.openLauncher()
+                }
+            }
+
             ACTION_STOP -> {
                 transitionTo(
                     launcherState = LauncherState.FINISHED,
                     inSession = false,
-                    timerSeconds = 0
+                    sessionPaused = false,
+                    remainingSeconds = 0
                 )
                 callbacks.openLauncher()
                 handler.postDelayed(
@@ -223,8 +278,23 @@ class SpatialSessionController(
     }
 
     fun openGameMenu() {
-        showTransientBanner("МЕНЮ ИГР СКОРО ПОЯВИТСЯ")
-        callbacks.openGameMenu()
+        val currentState = _uiState.value
+        val nextVisible = !currentState.gameMenuVisible
+        val nextGames = if (nextVisible) resolveAvailableGames() else currentState.availableGames
+        _uiState.value =
+            currentState.copy(
+                gameMenuVisible = nextVisible,
+                availableGames = nextGames,
+                gameMenuStatusText = buildGameMenuStatusText(
+                    menuVisible = nextVisible,
+                    gameCount = nextGames.size,
+                    inSession = currentState.inSession
+                )
+            )
+    }
+
+    fun closeGameMenu() {
+        _uiState.value = _uiState.value.copy(gameMenuVisible = false)
     }
 
     private fun updateHubConnectionFromIntent(intent: Intent) {
@@ -259,7 +329,8 @@ class SpatialSessionController(
         transitionTo(
             launcherState = LauncherState.FINISHED,
             inSession = false,
-            timerSeconds = 0
+            sessionPaused = false,
+            remainingSeconds = 0
         )
         callbacks.onSessionFinished(state.sessionPackage)
         callbacks.openLauncher()
@@ -267,6 +338,19 @@ class SpatialSessionController(
             { transitionTo(launcherState = LauncherState.WAITING) },
             AUTO_FINISH_RESET_DELAY_MS
         )
+    }
+
+    private fun resolveDurationSeconds(intent: Intent): Int {
+        val explicitDurationSeconds = intent.getIntExtra(EXTRA_DURATION_SECONDS, 0)
+        if (explicitDurationSeconds > 0) {
+            return explicitDurationSeconds
+        }
+        return maxOf(60, intent.getIntExtra(EXTRA_DURATION, 30) * 60)
+    }
+
+    private fun resolveRemainingSeconds(intent: Intent, durationSeconds: Int): Int {
+        val explicitRemainingSeconds = intent.getIntExtra(EXTRA_REMAINING_SECONDS, -1)
+        return if (explicitRemainingSeconds >= 0) explicitRemainingSeconds else durationSeconds
     }
 
     private fun sendHeartbeat() {
@@ -287,6 +371,15 @@ class SpatialSessionController(
                 model = Build.MODEL ?: "Meta Quest",
                 inSession = state.inSession,
                 sessionSeconds = state.sessionSeconds,
+                remainingSeconds = state.sessionRemainingSeconds,
+                sessionStatus = when {
+                    !state.inSession -> "ended"
+                    state.sessionPaused -> "paused"
+                    else -> "running"
+                },
+                paused = state.sessionPaused,
+                currentAppPackage = state.sessionPackage,
+                currentAppName = state.sessionAppName,
                 launcherState = state.launcherState,
                 hubIp = state.hubIp,
                 hubPort = state.hubPort,
@@ -311,36 +404,46 @@ class SpatialSessionController(
         }
     }
 
-    private fun updateTimer(nextSeconds: Int) {
+    private fun updateTimer(nextRemainingSeconds: Int) {
         val state = _uiState.value
-        val totalSeconds = state.sessionDurationMinutes * 60
-        val remainingSeconds = maxOf(0, totalSeconds - nextSeconds)
         _uiState.value =
             state.copy(
-                sessionSeconds = nextSeconds,
-                timerText = formatTimer(remainingSeconds)
+                sessionRemainingSeconds = nextRemainingSeconds,
+                sessionSeconds = maxOf(0, (state.sessionDurationMinutes * 60) - nextRemainingSeconds),
+                timerText = formatTimer(nextRemainingSeconds)
             )
     }
 
     private fun transitionTo(
         launcherState: LauncherState,
         inSession: Boolean = _uiState.value.inSession,
-        timerSeconds: Int = _uiState.value.sessionSeconds,
+        sessionPaused: Boolean = _uiState.value.sessionPaused,
+        remainingSeconds: Int = _uiState.value.sessionRemainingSeconds,
         sessionDurationMinutes: Int = _uiState.value.sessionDurationMinutes,
         sessionPackage: String? = _uiState.value.sessionPackage,
+        sessionAppName: String? = _uiState.value.sessionAppName,
         sessionActivity: String? = _uiState.value.sessionActivity
     ) {
-        val totalSeconds = sessionDurationMinutes * 60
-        val remainingSeconds = maxOf(0, totalSeconds - timerSeconds)
+        val clampedRemainingSeconds = maxOf(0, remainingSeconds)
+        val totalSeconds = maxOf(sessionDurationMinutes * 60, clampedRemainingSeconds)
         val baseState =
             _uiState.value.copy(
                 launcherState = launcherState,
                 inSession = inSession,
-                sessionSeconds = timerSeconds,
+                sessionPaused = sessionPaused,
+                sessionSeconds = maxOf(0, totalSeconds - clampedRemainingSeconds),
+                sessionRemainingSeconds = clampedRemainingSeconds,
                 sessionDurationMinutes = sessionDurationMinutes,
                 sessionPackage = sessionPackage,
+                sessionAppName = sessionAppName,
                 sessionActivity = sessionActivity,
-                batteryStatus = currentBatteryStatus()
+                batteryStatus = currentBatteryStatus(),
+                availableGames = markCurrentSessionGame(_uiState.value.availableGames, if (inSession) sessionPackage else null),
+                gameMenuStatusText = buildGameMenuStatusText(
+                    menuVisible = _uiState.value.gameMenuVisible,
+                    gameCount = _uiState.value.availableGames.size,
+                    inSession = inSession
+                )
             )
 
         _uiState.value =
@@ -366,9 +469,18 @@ class SpatialSessionController(
                 LauncherState.ACTIVE ->
                     baseState.copy(
                         statusText = "Сессия активна",
-                        descriptionText = sessionPackage ?: "Игра запущена",
-                        timerText = formatTimer(remainingSeconds),
+                        descriptionText = sessionAppName ?: sessionPackage ?: "Игра запущена",
+                        timerText = formatTimer(clampedRemainingSeconds),
                         timerTone = TimerTone.DEFAULT,
+                        showBottomActions = true
+                    )
+
+                LauncherState.PAUSED ->
+                    baseState.copy(
+                        statusText = "Сессия на паузе",
+                        descriptionText = sessionAppName ?: sessionPackage ?: "Игра будет продолжена оператором",
+                        timerText = formatTimer(clampedRemainingSeconds),
+                        timerTone = TimerTone.WARNING,
                         showBottomActions = true
                     )
 
@@ -376,7 +488,7 @@ class SpatialSessionController(
                     baseState.copy(
                         statusText = "Осталось 5 минут",
                         descriptionText = "Если хотите продлить время — позовите оператора",
-                        timerText = formatTimer(remainingSeconds),
+                        timerText = formatTimer(clampedRemainingSeconds),
                         timerTone = TimerTone.WARNING,
                         showBottomActions = true
                     )
@@ -399,6 +511,99 @@ class SpatialSessionController(
                         showBottomActions = true
                     )
             }
+    }
+
+    private fun resolveAvailableGames(): List<LauncherGameEntry> {
+        val packageManager = appContext.packageManager
+        val launchIntents = listOf(
+            Intent(Intent.ACTION_MAIN).addCategory("com.oculus.intent.category.VR"),
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        )
+        val entries = linkedMapOf<String, LauncherGameEntry>()
+
+        for (launchIntent in launchIntents) {
+            val resolvedActivities =
+                try {
+                    packageManager.queryIntentActivities(
+                        launchIntent,
+                        PackageManager.ResolveInfoFlags.of(0)
+                    )
+                } catch (_: Throwable) {
+                    @Suppress("DEPRECATION")
+                    packageManager.queryIntentActivities(launchIntent, 0)
+                }
+
+            for (resolved in resolvedActivities) {
+                val packageName = resolved.activityInfo?.packageName ?: continue
+                val activityName = resolved.activityInfo?.name
+                if (!isAllowedLauncherPackage(packageName, activityName)) {
+                    continue
+                }
+                val displayName = resolved.loadLabel(packageManager)?.toString()?.trim().orEmpty()
+                entries.putIfAbsent(
+                    packageName,
+                    LauncherGameEntry(
+                        packageName = packageName,
+                        displayName = displayName.ifBlank { prettifyPackageName(packageName) },
+                        activityName = activityName,
+                        isCurrentSessionApp = packageName == _uiState.value.sessionPackage
+                    )
+                )
+            }
+        }
+
+        return entries.values.sortedBy { it.displayName.lowercase() }
+    }
+
+    private fun isAllowedLauncherPackage(packageName: String, activityName: String?): Boolean {
+        if (packageName == appContext.packageName) {
+            return false
+        }
+        if (packageName.startsWith("com.oculus.") ||
+            packageName.startsWith("com.meta.") ||
+            packageName.startsWith("com.android.") ||
+            packageName.startsWith("android.") ||
+            packageName.startsWith("su.happ.")
+        ) {
+            return false
+        }
+        if (activityName?.contains("Settings", ignoreCase = true) == true) {
+            return false
+        }
+        return true
+    }
+
+    private fun prettifyPackageName(packageName: String): String {
+        val tail = packageName.substringAfterLast('.')
+        return tail
+            .replace('_', ' ')
+            .replace('-', ' ')
+            .replace(Regex("([a-z])([A-Z])"), "$1 $2")
+            .replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+    }
+
+    private fun markCurrentSessionGame(
+        games: List<LauncherGameEntry>,
+        sessionPackage: String?
+    ): List<LauncherGameEntry> {
+        return games.map { game ->
+            game.copy(isCurrentSessionApp = sessionPackage != null && game.packageName == sessionPackage)
+        }
+    }
+
+    private fun buildGameMenuStatusText(
+        menuVisible: Boolean,
+        gameCount: Int,
+        inSession: Boolean
+    ): String {
+        if (!menuVisible) {
+            return "Откройте меню, чтобы посмотреть доступные игры"
+        }
+        return when {
+            gameCount == 0 -> "Подходящие VR-игры не найдены"
+            inSession -> "Текущую игру запускает оператор из панели"
+            else -> "Список игр для этой станции"
+        }
     }
 
     private fun currentBatteryStatus(): String {
@@ -606,13 +811,24 @@ class SpatialSessionController(
 
         private const val EXTRA_SESSION_ACTION = "SESSION_ACTION"
         private const val EXTRA_DURATION = "DURATION"
+        private const val EXTRA_DURATION_SECONDS = "DURATION_SECONDS"
         private const val EXTRA_PACKAGE = "PACKAGE"
+        private const val EXTRA_APP_NAME = "APP_NAME"
         private const val EXTRA_ACTIVITY = "ACTIVITY"
+        private const val EXTRA_CURRENT_APP_PACKAGE = "CURRENT_APP_PACKAGE"
+        private const val EXTRA_CURRENT_APP_NAME = "CURRENT_APP_NAME"
+        private const val EXTRA_REMAINING_SECONDS = "REMAINING_SECONDS"
+        private const val EXTRA_SESSION_STATUS = "SESSION_STATUS"
+        private const val EXTRA_PAUSED = "PAUSED"
         private const val EXTRA_HUB_IP = "HUB_IP"
         private const val EXTRA_HUB_PORT = "HUB_PORT"
         private const val EXTRA_MESSAGE = "MESSAGE"
 
         private const val ACTION_START = "START"
+        private const val ACTION_RESUME = "RESUME"
+        private const val ACTION_PAUSE = "PAUSE"
+        private const val ACTION_SWITCH = "SWITCH"
+        private const val ACTION_SYNC = "SYNC"
         private const val ACTION_STOP = "STOP"
         private const val ACTION_SHOW_MESSAGE = "SHOW_MESSAGE"
         private const val ACTION_OPEN_LAUNCHER = "OPEN_LAUNCHER"

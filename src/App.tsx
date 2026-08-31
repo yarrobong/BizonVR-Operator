@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Layout } from './components/Layout';
 import { Map } from './pages/Map';
 import { Devices } from './pages/Devices';
+import { Cast } from './pages/Cast';
 
 const queryClient = new QueryClient();
 
@@ -16,6 +17,7 @@ export default function App() {
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
         <Routes>
+          <Route path="/cast/:deviceId" element={<Cast />} />
           <Route path="/" element={<Layout />}>
             <Route index element={<Navigate to="/dashboard" replace />} />
             <Route path="dashboard" element={<Map />} />

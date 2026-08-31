@@ -9,7 +9,7 @@ These checks require a real Meta Quest headset and Local Hub on the same LAN.
 3. Build the production agent APK with `cd quest-agent-spatial-spike && ./gradlew :app:assembleDebug`.
 4. Connect Quest over USB and accept USB debugging in headset.
 5. Install `quest-agent-spatial-spike` APK.
-6. Launch `com.bizonvr.spatialspike/.SpatialSpikeActivity` with `HUB_IP`/`HUB_PORT`.
+6. Launch `com.bizonvr.spatialspike/.SpatialLauncherActivity` with `HUB_IP`/`HUB_PORT` using `android.intent.action.MAIN` and `com.oculus.intent.category.VR`.
 7. Verify device appears as available/new, pairs into inventory, and has `agent_status=online`, `adb_status=online`.
 8. Watch Local Hub logs and verify heartbeat POSTs are not duplicated in the same second after launch.
 

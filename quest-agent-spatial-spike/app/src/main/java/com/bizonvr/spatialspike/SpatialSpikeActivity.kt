@@ -1,22 +1,26 @@
 package com.bizonvr.spatialspike
 
 import android.content.Intent
+import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
@@ -56,6 +60,31 @@ import com.meta.spatial.vr.VRFeature
 class SpatialSpikeActivity : AppSystemActivity() {
   private lateinit var sessionController: SpatialSessionController
 
+  private fun persistHubConnectionFromLaunchIntent(sourceIntent: Intent?) {
+    val nextHubIp = sourceIntent?.getStringExtra("HUB_IP")?.trim().orEmpty()
+    if (nextHubIp.isBlank() || nextHubIp == "127.0.0.1" || nextHubIp == "localhost" || nextHubIp == "::1") {
+      return
+    }
+    val nextHubPort = sourceIntent?.getIntExtra("HUB_PORT", 3001) ?: 3001
+    getSharedPreferences("spatial_quest_agent", Context.MODE_PRIVATE)
+      .edit()
+      .putString("hub_ip", nextHubIp)
+      .putInt("hub_port", nextHubPort)
+      .apply()
+  }
+
+  private fun startHeartbeatServiceWithLaunchIntent(sourceIntent: Intent?) {
+    persistHubConnectionFromLaunchIntent(sourceIntent)
+    val serviceIntent = Intent(this, HeartbeatForegroundService::class.java).apply {
+      sourceIntent?.extras?.let { putExtras(it) }
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      startForegroundService(serviceIntent)
+    } else {
+      startService(serviceIntent)
+    }
+  }
+
   override fun registerFeatures(): List<SpatialFeature> {
     return listOf(
         VRFeature(this),
@@ -65,12 +94,7 @@ class SpatialSpikeActivity : AppSystemActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    val serviceIntent = Intent(this, HeartbeatForegroundService::class.java)
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      startForegroundService(serviceIntent)
-    } else {
-      startService(serviceIntent)
-    }
+    startHeartbeatServiceWithLaunchIntent(intent)
     sessionController = SpatialSessionController(this, object : SpatialSessionCallbacks {
       override fun launchGame(packageName: String?, activityName: String?) {
         QuestAppLauncher.launchGame(this@SpatialSpikeActivity, packageName, activityName)
@@ -83,9 +107,6 @@ class SpatialSpikeActivity : AppSystemActivity() {
       override fun openLauncher() {
         QuestAppLauncher.bringToFront(this@SpatialSpikeActivity, SpatialSpikeActivity::class.java)
       }
-
-      override fun openGameMenu() {
-      }
     })
     sessionController.handleIntent(intent)
     sessionController.start(heartbeatOwner = false)
@@ -93,6 +114,7 @@ class SpatialSpikeActivity : AppSystemActivity() {
 
   override fun onNewIntent(intent: Intent?) {
     super.onNewIntent(intent)
+    startHeartbeatServiceWithLaunchIntent(intent)
     sessionController.handleIntent(intent)
   }
 
@@ -132,7 +154,8 @@ class SpatialSpikeActivity : AppSystemActivity() {
                     SpatialSpikePanel(
                         uiState = uiState,
                         onCallOperator = { sessionController.callOperator() },
-                        onOpenMenu = { sessionController.openGameMenu() }
+                        onOpenMenu = { sessionController.openGameMenu() },
+                        onCloseMenu = { sessionController.closeGameMenu() }
                     )
                   }
                 }
@@ -154,7 +177,8 @@ class SpatialSpikeActivity : AppSystemActivity() {
 private fun SpatialSpikePanel(
     uiState: LauncherUiState,
     onCallOperator: () -> Unit,
-    onOpenMenu: () -> Unit
+    onOpenMenu: () -> Unit,
+    onCloseMenu: () -> Unit
 ) {
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -189,124 +213,254 @@ private fun SpatialSpikePanel(
                     TimerTone.DANGER -> Color(0xFFFF727E)
                 }
 
-            Column(modifier = Modifier.fillMaxSize()) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "BizonVR Club Mode",
-                        color = Color(0xFF00E5FF),
-                        fontSize = 27.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.weight(1f)
-                    )
-
-                    Text(
-                        text = "ID: ${uiState.pairingId}",
-                        color = Color(0xFF8BF6FF),
-                        fontSize = 19.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier =
-                            Modifier.border(
-                                    width = 1.dp,
-                                    color = Color(0x5500E5FF),
-                                    shape = RoundedCornerShape(999.dp)
-                                )
-                                .padding(horizontal = 18.dp, vertical = 10.dp)
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(34.dp))
-
-                Column(
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Text(
-                        text = uiState.transientBanner ?: uiState.statusText,
-                        color = if (uiState.transientBanner != null) Color(0xFFFF727E) else Color(0xFFF8FAFC),
-                        fontSize = statusSize,
-                        fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Center
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Text(
-                        text = uiState.timerText,
-                        color = timerColor,
-                        fontSize = headlineSize,
-                        fontWeight = FontWeight.ExtraBold,
-                        textAlign = TextAlign.Center
-                    )
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    Text(
-                        text = uiState.descriptionText,
-                        color = Color(0xFFB6C2CF),
-                        fontSize = bodySize,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth(0.78f)
-                    )
-                }
-
-                if (uiState.showBottomActions) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                Column(modifier = Modifier.fillMaxSize()) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.Center
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Button(
-                            onClick = onCallOperator,
-                            colors =
-                                ButtonDefaults.buttonColors(
-                                    containerColor = Color(0x20FF4D5E),
-                                    contentColor = Color(0xFFFF727E)
-                                ),
-                            modifier = Modifier.weight(1f).height(72.dp),
-                            shape = RoundedCornerShape(20.dp)
-                        ) {
-                            Text(
-                                text = "Вызвать оператора",
-                                fontSize = buttonSize,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
+                        Text(
+                            text = "BizonVR Club Mode",
+                            color = Color(0xFF00E5FF),
+                            fontSize = 27.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f)
+                        )
 
-                        Spacer(modifier = Modifier.width(20.dp))
-
-                        Button(
-                            onClick = onOpenMenu,
-                            colors =
-                                ButtonDefaults.buttonColors(
-                                    containerColor = Color(0x2200E5FF),
-                                    contentColor = Color(0xFF8BF6FF)
-                                ),
-                            modifier = Modifier.weight(1f).height(72.dp),
-                            shape = RoundedCornerShape(20.dp)
-                        ) {
-                            Text(
-                                text = "Меню игр",
-                                fontSize = buttonSize,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
+                        Text(
+                            text = "ID: ${uiState.pairingId}",
+                            color = Color(0xFF8BF6FF),
+                            fontSize = 19.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier =
+                                Modifier.border(
+                                        width = 1.dp,
+                                        color = Color(0x5500E5FF),
+                                        shape = RoundedCornerShape(999.dp)
+                                    )
+                                    .padding(horizontal = 18.dp, vertical = 10.dp)
+                        )
                     }
-                } else {
-                    Spacer(modifier = Modifier.height(72.dp))
+
+                    Spacer(modifier = Modifier.height(34.dp))
+
+                    Column(
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            text = uiState.transientBanner ?: uiState.statusText,
+                            color = if (uiState.transientBanner != null) Color(0xFFFF727E) else Color(0xFFF8FAFC),
+                            fontSize = statusSize,
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Text(
+                            text = uiState.timerText,
+                            color = timerColor,
+                            fontSize = headlineSize,
+                            fontWeight = FontWeight.ExtraBold,
+                            textAlign = TextAlign.Center
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Text(
+                            text = uiState.descriptionText,
+                            color = Color(0xFFB6C2CF),
+                            fontSize = bodySize,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth(0.78f)
+                        )
+                    }
+
+                    if (uiState.showBottomActions) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Button(
+                                onClick = onCallOperator,
+                                colors =
+                                    ButtonDefaults.buttonColors(
+                                        containerColor = Color(0x20FF4D5E),
+                                        contentColor = Color(0xFFFF727E)
+                                    ),
+                                modifier = Modifier.weight(1f).height(72.dp),
+                                shape = RoundedCornerShape(20.dp)
+                            ) {
+                                Text(
+                                    text = "Вызвать оператора",
+                                    fontSize = buttonSize,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(20.dp))
+
+                            Button(
+                                onClick = onOpenMenu,
+                                colors =
+                                    ButtonDefaults.buttonColors(
+                                        containerColor = Color(0x2200E5FF),
+                                        contentColor = Color(0xFF8BF6FF)
+                                    ),
+                                modifier = Modifier.weight(1f).height(72.dp),
+                                shape = RoundedCornerShape(20.dp)
+                            ) {
+                                Text(
+                                    text = "Меню игр",
+                                    fontSize = buttonSize,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    } else {
+                        Spacer(modifier = Modifier.height(72.dp))
+                    }
+
+                    Spacer(modifier = Modifier.height(22.dp))
+
+                    Text(
+                        text = "${uiState.footerLine}, ${uiState.wifiStatus}, ${uiState.agentStatus}, ${uiState.batteryStatus}",
+                        color = Color(0xFF94A3B8),
+                        fontSize = footerSize,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
 
-                Spacer(modifier = Modifier.height(22.dp))
+                if (uiState.gameMenuVisible) {
+                    GameMenuOverlay(
+                        uiState = uiState,
+                        onCloseMenu = onCloseMenu
+                    )
+                }
+            }
+        }
+    }
+}
 
-                Text(
-                    text = "${uiState.footerLine}, ${uiState.wifiStatus}, ${uiState.agentStatus}, ${uiState.batteryStatus}",
-                    color = Color(0xFF94A3B8),
-                    fontSize = footerSize,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
+@Composable
+private fun GameMenuOverlay(
+    uiState: LauncherUiState,
+    onCloseMenu: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = Color(0xEE04070D),
+        shape = RoundedCornerShape(28.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(28.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Меню игр",
+                        color = Color(0xFFF8FAFC),
+                        fontSize = 34.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = uiState.gameMenuStatusText,
+                        color = Color(0xFF8CA3B8),
+                        fontSize = 18.sp
+                    )
+                }
+
+                Button(
+                    onClick = onCloseMenu,
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            containerColor = Color(0x22FFFFFF),
+                            contentColor = Color(0xFFF8FAFC)
+                        ),
+                    shape = RoundedCornerShape(18.dp)
+                ) {
+                    Text(text = "Закрыть", fontWeight = FontWeight.Bold)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            if (uiState.availableGames.isEmpty()) {
+                Box(
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "На шлеме пока нет доступных игр для клубного меню.",
+                        color = Color(0xFFB6C2CF),
+                        fontSize = 22.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().fillMaxHeight(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    items(uiState.availableGames) { game ->
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = if (game.isCurrentSessionApp) Color(0x2200E5FF) else Color(0x120F172A),
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (game.isCurrentSessionApp) Color(0x5500E5FF) else Color(0x22364759),
+                                        shape = RoundedCornerShape(20.dp)
+                                    )
+                        ) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = game.displayName,
+                                        color = Color(0xFFF8FAFC),
+                                        fontSize = 23.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    if (game.isCurrentSessionApp) {
+                                        Text(
+                                            text = "Сейчас в сессии",
+                                            color = Color(0xFF8BF6FF),
+                                            fontSize = 15.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier =
+                                                Modifier.border(
+                                                        width = 1.dp,
+                                                        color = Color(0x4400E5FF),
+                                                        shape = RoundedCornerShape(999.dp)
+                                                    )
+                                                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = game.packageName,
+                                    color = Color(0xFF8CA3B8),
+                                    fontSize = 16.sp
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }

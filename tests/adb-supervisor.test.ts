@@ -84,4 +84,24 @@ describe("ADB Supervisor", () => {
 
     assert.strictEqual(state?.status, "unauthorized");
   });
+
+  it("marks mismatched identity as different_device", async () => {
+    const supervisor = createAdbSupervisor({
+      port: 5555,
+      getKnownState: () => ({ ip: "192.168.0.20", previousIps: [] }),
+      rememberRoute: () => undefined,
+      checkRoutePortOpen: async () => true,
+      adbDisconnect: async () => ({ success: true }),
+      adbConnect: async () => ({ success: true, message: "connected to 192.168.0.20:5555" }),
+      verifyRouteIdentity: async () => ({ matched: false, message: "android_id mismatch" }),
+      checkAdbRecoveryPermission: () => ({ allowed: false, status: "permission_missing", message: "missing" }),
+      tryEnableWirelessAdb: async () => ({ success: false, status: "permission_missing", message: "missing" }),
+    });
+
+    const result = await supervisor.forceReconnect("QUEST-04", {
+      route: { stableSerial: "QUEST-04", ip: "192.168.0.20", androidId: "ANDROID-04", agentOnline: true },
+    });
+
+    assert.strictEqual(result?.status, "different_device");
+  });
 });

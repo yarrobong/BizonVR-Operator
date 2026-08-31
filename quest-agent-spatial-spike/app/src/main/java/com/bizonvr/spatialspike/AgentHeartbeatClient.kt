@@ -15,6 +15,11 @@ data class HeartbeatSnapshot(
     val model: String,
     val inSession: Boolean,
     val sessionSeconds: Int,
+    val remainingSeconds: Int,
+    val sessionStatus: String,
+    val paused: Boolean,
+    val currentAppPackage: String?,
+    val currentAppName: String?,
     val launcherState: LauncherState,
     val hubIp: String,
     val hubPort: Int,
@@ -71,6 +76,11 @@ class AgentHeartbeatClient {
             .put("model", snapshot.model)
             .put("in_session", snapshot.inSession)
             .put("session_seconds", snapshot.sessionSeconds)
+            .put("remaining_seconds", snapshot.remainingSeconds)
+            .put("session_status", snapshot.sessionStatus)
+            .put("paused", snapshot.paused)
+            .put("current_app_package", snapshot.currentAppPackage)
+            .put("current_app_name", snapshot.currentAppName)
             .put("state", snapshot.launcherState.name)
             .toString()
         postJson(

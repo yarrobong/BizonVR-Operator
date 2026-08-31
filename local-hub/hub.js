@@ -9,6 +9,19 @@ import { spawn, execFileSync } from 'child_process';
 import { buildHeartbeatIdentity, prefersUsbForCommand, selectPreferredExecutionRoute } from './route-selection.js';
 import { createAdbSupervisor } from './adb-supervisor.js';
 import { checkAdbRecoveryPermission, reportAdbRecoveryStatus, tryEnableWirelessAdb } from './adb-recovery-adapter.js';
+import {
+    buildAdbScreenrecordArgs,
+    buildFfmpegArgs,
+    createStreamStopper,
+    getFallbackResponseStrategy,
+    getStreamProfile,
+    isResponseWritable,
+    resolveStreamRequest,
+    safeEnd,
+    safeWrite,
+    safeWriteHead,
+} from './streaming.js';
+import { DEFAULT_CAST_PROFILE, DEFAULT_CAST_TRANSPORT } from '../src/shared/cast-config.js';
 
 const HUB_ID = 1;
 const API_URL = process.env.APP_URL || 'http://localhost:3000';
@@ -17,7 +30,7 @@ const LOCAL_SERVER_PORT = process.env.HUB_PORT || 3001;
 const HUB_HOST = resolveHubHost();
 const HUB_TOKEN = process.env.HUB_TOKEN || '';
 const QUEST_AGENT_PACKAGE = process.env.QUEST_AGENT_PACKAGE || 'com.bizonvr.spatialspike';
-const QUEST_AGENT_MAIN_ACTIVITY = process.env.QUEST_AGENT_MAIN_ACTIVITY || '.SpatialSpikeActivity';
+const QUEST_AGENT_MAIN_ACTIVITY = process.env.QUEST_AGENT_MAIN_ACTIVITY || '.SpatialLauncherActivity';
 const QUEST_AGENT_APK_PATH = resolveQuestAgentApkPath();
 const ENABLE_WIRELESS_ADB = process.env.ENABLE_WIRELESS_ADB === '1';
 const SCRCPY_MAX_SIZE = process.env.SCRCPY_MAX_SIZE || '1600';
@@ -40,12 +53,9 @@ const INCLUDED_NON_VR_PACKAGES = new Set([
 ]);
 const STREAM_FRAME_INTERVAL_MS = Number(process.env.STREAM_FRAME_INTERVAL_MS || 120);
 const DEVICE_SERIAL_REGEX = /^[A-Za-z0-9._:-]+$/;
-const STREAM_VIDEO_SIZE = process.env.STREAM_VIDEO_SIZE || '1024x576';
-const STREAM_VIDEO_BITRATE = process.env.STREAM_VIDEO_BITRATE || '4000000';
-const STREAM_VIDEO_FPS = Number(process.env.STREAM_VIDEO_FPS || 12);
-const STREAM_JPEG_QUALITY = Number(process.env.STREAM_JPEG_QUALITY || 7);
 const STREAM_BOOT_TIMEOUT_MS = Number(process.env.STREAM_BOOT_TIMEOUT_MS || 7000);
-const STREAM_MODE = process.env.STREAM_MODE || 'mpjpeg';
+const STREAM_MODE = process.env.STREAM_MODE || DEFAULT_CAST_TRANSPORT;
+const STREAM_PROFILE = process.env.STREAM_PROFILE || DEFAULT_CAST_PROFILE;
 const STREAM_DISPLAY_ID = process.env.STREAM_DISPLAY_ID || '';
 const ICON_CACHE_ROOT = path.resolve(process.cwd(), '.cache', 'apk-icons');
 const APK_CACHE_ROOT = path.join(ICON_CACHE_ROOT, 'apks');
@@ -63,6 +73,33 @@ const AGENT_PACKAGES = new Set(['com.bizonvr.spatialspike', QUEST_AGENT_PACKAGE]
 
 console.log(`Starting Local Hub (${HUB_ID}) connecting to ${API_URL}`);
 console.log(`[Local Hub] Agent callback target: http://${HUB_HOST}:${LOCAL_SERVER_PORT}`);
+
+process.on('uncaughtException', (error) => {
+    console.error('[Local Hub] uncaughtException', {
+        message: error?.message || String(error),
+        stack: error?.stack || null,
+        active_casts: Array.from(activeCastStreams.entries()).map(([route, stream]) => ({
+            route,
+            transport: stream.transport,
+            profile: stream.profile,
+            startedAt: stream.startedAt,
+        })),
+    });
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('[Local Hub] unhandledRejection', {
+        reason: reason instanceof Error
+            ? { message: reason.message, stack: reason.stack || null }
+            : String(reason),
+        active_casts: Array.from(activeCastStreams.entries()).map(([route, stream]) => ({
+            route,
+            transport: stream.transport,
+            profile: stream.profile,
+            startedAt: stream.startedAt,
+        })),
+    });
+});
 
 // Local Heartbeat Tracking
 let agentHeartbeats = {};
@@ -139,6 +176,8 @@ const adbSupervisor = createAdbSupervisor({
 
 // Keep track of running scrcpy processes
 const scrcpyProcesses = {};
+const activeCastStreams = new Map();
+let screencapFallbackCount = 0;
 
 // Regex for safe package name validation
 const PACKAGE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/;
@@ -313,6 +352,10 @@ function toWirelessSerial(ip) {
     return `${ip}:${WIRELESS_ADB_PORT}`;
 }
 
+function isTcpAdbSerial(value) {
+    return /^\d+\.\d+\.\d+\.\d+:\d+$/.test(String(value || '').trim());
+}
+
 function parseAdbDevices(output) {
     return output
         .split('\n')
@@ -393,6 +436,79 @@ function getDeviceModel(serial) {
     }
 }
 
+function mergeWirelessStateEntries(primaryKey, aliasKey) {
+    if (!primaryKey || !aliasKey || primaryKey === aliasKey) {
+        return primaryKey;
+    }
+
+    const primary = wirelessStateIndex[primaryKey] || {};
+    const alias = wirelessStateIndex[aliasKey] || {};
+    wirelessStateIndex[primaryKey] = {
+        ...alias,
+        ...primary,
+        stableSerial: primaryKey,
+        usbSerial: primary.usbSerial || alias.usbSerial || null,
+        wirelessSerial: primary.wirelessSerial || alias.wirelessSerial || null,
+        ip: primary.ip || alias.ip || null,
+        wifiSsid: primary.wifiSsid || alias.wifiSsid || null,
+        agentId: primary.agentId || alias.agentId || null,
+        androidId: primary.androidId || alias.androidId || null,
+        model: primary.model || alias.model || 'Meta Quest',
+        previousIps: normalizeIpList([
+            ...(primary.previousIps || []),
+            ...(alias.previousIps || []),
+            primary.ip || null,
+            alias.ip || null,
+        ]).slice(0, 8),
+        lastSeenAt: Math.max(Number(primary.lastSeenAt || 0), Number(alias.lastSeenAt || 0), Date.now()),
+    };
+    delete wirelessStateIndex[aliasKey];
+    saveWirelessStateIndex();
+    return primaryKey;
+}
+
+function findCanonicalStableSerialForState(stableSerial, state) {
+    if (!stableSerial || !state || !isTcpAdbSerial(stableSerial)) {
+        return stableSerial;
+    }
+    if (state.usbSerial && !isTcpAdbSerial(state.usbSerial)) {
+        return state.usbSerial;
+    }
+    const sibling = Object.entries(wirelessStateIndex).find(([key, entry]) =>
+        key !== stableSerial &&
+        !isTcpAdbSerial(key) &&
+        (
+            (entry?.wirelessSerial && state.wirelessSerial && entry.wirelessSerial === state.wirelessSerial) ||
+            (entry?.ip && state.ip && entry.ip === state.ip) ||
+            (entry?.agentId && state.agentId && entry.agentId === state.agentId)
+        )
+    );
+    if (sibling) {
+        return sibling[0];
+    }
+    if (state.wirelessSerial) {
+        const liveStable = getDeviceStableSerial(state.wirelessSerial);
+        if (liveStable && !isTcpAdbSerial(liveStable)) {
+            return liveStable;
+        }
+    }
+    return stableSerial;
+}
+
+function collapseWirelessStateAliases() {
+    let changed = false;
+    for (const [stableSerial, state] of Object.entries(wirelessStateIndex)) {
+        const canonicalStableSerial = findCanonicalStableSerialForState(stableSerial, state);
+        if (canonicalStableSerial && canonicalStableSerial !== stableSerial) {
+            mergeWirelessStateEntries(canonicalStableSerial, stableSerial);
+            changed = true;
+        }
+    }
+    if (changed) {
+        saveWirelessStateIndex();
+    }
+}
+
 function rememberWirelessRoute(stableSerial, updates) {
     const previousState = wirelessStateIndex[stableSerial] || {};
     const nextIp = updates.ip || previousState.ip || null;
@@ -407,6 +523,7 @@ function rememberWirelessRoute(stableSerial, updates) {
         lastSeenAt: Date.now(),
     };
     saveWirelessStateIndex();
+    collapseWirelessStateAliases();
 }
 
 function summarizeRouteHealth(route, cachedState = null) {
@@ -417,7 +534,7 @@ function summarizeRouteHealth(route, cachedState = null) {
     const ipChanged = Boolean(route.ip && cachedIp && route.ip !== cachedIp);
     const hasWirelessRoute = Boolean(currentIp);
     const isConnectedOverWifi = Boolean(route.executionSerial && route.executionSerial.includes(':'));
-    const usbAvailable = Boolean(route.usbSerial);
+    const usbAvailable = route.usbOnlineSnapshot === true;
     const agentOnline = Boolean(route.agentOnline);
     const agentKnown = Boolean(route.agentId || route.pairingId || effectiveState?.agentId);
     const unauthorized = route.adbState === 'unauthorized';
@@ -429,6 +546,8 @@ function summarizeRouteHealth(route, cachedState = null) {
             ? 'tcpip_unavailable'
             : supervisorState?.status === 'port_closed'
                 ? 'port_closed'
+                : supervisorState?.status === 'different_device'
+                    ? 'different_device'
                 : supervisorState?.status === 'unauthorized'
                     ? 'unauthorized'
                     : hasWirelessRoute
@@ -551,6 +670,8 @@ function summarizeRouteHealth(route, cachedState = null) {
                 : 'Quest Agent heartbeat is arriving, but ADB is offline.',
             next_step: degradedAdbStatus === 'reconnecting'
                 ? 'Local Hub is retrying saved Wi-Fi routes with backoff. Leave the headset on club Wi-Fi.'
+                : degradedAdbStatus === 'different_device'
+                    ? 'ADB connected to a different Quest on the remembered route. Reconnect USB once to refresh the trusted identity.'
                 : degradedAdbStatus === 'tcpip_unavailable'
                     ? 'Wireless debugging is not answering on port 5555. Use USB Repair or future secure-settings recovery.'
                     : degradedAdbStatus === 'port_closed'
@@ -580,6 +701,8 @@ function summarizeRouteHealth(route, cachedState = null) {
                     : `Remembered Wi-Fi route ${currentIp}:${WIRELESS_ADB_PORT} is saved. Local Hub is still trying to reconnect.`,
             next_step: degradedAdbStatus === 'reconnecting'
                 ? 'Local Hub is retrying last known IPs and heartbeat routes.'
+                : degradedAdbStatus === 'different_device'
+                    ? 'The remembered Wi-Fi route points at another device. Reconnect USB and refresh the wireless route.'
                 : effectiveState?.hadSuccessfulWifiConnection
                     ? 'Possible causes: VPN blocks the LAN, IP changed, or wireless debugging was reset. Connect USB and run USB Repair.'
                     : 'Leave the headset awake on club Wi-Fi or reconnect USB once to finish setup.',
@@ -668,7 +791,13 @@ function maybeAutoStartAgent(route, routeHealth) {
 }
 
 function findStableSerialByWirelessIp(ip) {
-    for (const [stableSerial, state] of Object.entries(wirelessStateIndex)) {
+    const entries = Object.entries(wirelessStateIndex).sort(([left], [right]) => {
+        const leftTcp = isTcpAdbSerial(left);
+        const rightTcp = isTcpAdbSerial(right);
+        if (leftTcp === rightTcp) return 0;
+        return leftTcp ? 1 : -1;
+    });
+    for (const [stableSerial, state] of entries) {
         if (state?.ip === ip || state?.wirelessSerial === toWirelessSerial(ip)) {
             return stableSerial;
         }
@@ -696,35 +825,60 @@ function connectWirelessTarget(stableSerial, force = false) {
     for (const ip of candidateIps) {
         const wirelessSerial = toWirelessSerial(ip);
         try {
-            if (force && state?.wirelessSerial && state.wirelessSerial !== wirelessSerial) {
-                runAdbCapture(['disconnect', state.wirelessSerial], { stdio: ['ignore', 'pipe', 'pipe'] });
+            if (force) {
+                const staleRoutes = normalizeIpList([wirelessSerial, state?.wirelessSerial]);
+                for (const staleRoute of staleRoutes) {
+                    try {
+                        runAdbCapture(['disconnect', staleRoute], { stdio: ['ignore', 'pipe', 'pipe'] });
+                    } catch (disconnectError) {
+                        logHub('Wireless ADB', `Disconnect before forced reconnect failed for ${staleRoute}`, {
+                            stableSerial,
+                            error: disconnectError instanceof Error ? disconnectError.message : String(disconnectError),
+                        });
+                    }
+                }
+                sleepMs(250);
             }
-            const output = runAdbCapture(['connect', wirelessSerial], { stdio: ['ignore', 'pipe', 'pipe'] });
-            const normalized = output.toLowerCase();
-            const connected = normalized.includes('connected to') || normalized.includes('already connected to');
-            if (connected) {
-                let verified = false;
-                for (let attempt = 0; attempt < 4; attempt += 1) {
-                    if (isAdbRouteOnline(wirelessSerial)) {
-                        verified = true;
+            for (let connectAttempt = 0; connectAttempt < (force ? 2 : 1); connectAttempt += 1) {
+                const output = runAdbCapture(['connect', wirelessSerial], { stdio: ['ignore', 'pipe', 'pipe'] });
+                const normalized = output.toLowerCase();
+                const connected = normalized.includes('connected to') || normalized.includes('already connected to');
+                if (connected) {
+                    let verified = false;
+                    for (let attempt = 0; attempt < 6; attempt += 1) {
+                        if (isAdbRouteOnline(wirelessSerial)) {
+                            verified = true;
+                            break;
+                        }
+                        sleepMs(250);
+                    }
+                    if (!verified) {
+                        console.warn(`[Wireless ADB] Connected ${wirelessSerial} but adb get-state is not stable yet`);
+                        if (force && connectAttempt === 0) {
+                            try {
+                                runAdbCapture(['disconnect', wirelessSerial], { stdio: ['ignore', 'pipe', 'pipe'] });
+                            } catch (disconnectError) {
+                                logHub('Wireless ADB', `Disconnect after unstable forced connect failed for ${wirelessSerial}`, {
+                                    stableSerial,
+                                    error: disconnectError instanceof Error ? disconnectError.message : String(disconnectError),
+                                });
+                            }
+                            sleepMs(300);
+                            continue;
+                        }
                         break;
                     }
-                    sleepMs(250);
+                    logHub('Wireless ADB', `Connected ${wirelessSerial} for ${stableSerial}`);
+                    rememberWirelessRoute(stableSerial, {
+                        ip,
+                        wirelessSerial,
+                        hadSuccessfulWifiConnection: true,
+                        lastVerifiedWirelessAt: Date.now(),
+                    });
+                    return true;
                 }
-                if (!verified) {
-                    console.warn(`[Wireless ADB] Connected ${wirelessSerial} but adb get-state is not stable yet`);
-                    continue;
-                }
-                logHub('Wireless ADB', `Connected ${wirelessSerial} for ${stableSerial}`);
-                rememberWirelessRoute(stableSerial, {
-                    ip,
-                    wirelessSerial,
-                    hadSuccessfulWifiConnection: true,
-                    lastVerifiedWirelessAt: Date.now(),
-                });
-                return true;
+                console.warn(`[Wireless ADB] Connect did not succeed for ${wirelessSerial}: ${output.trim()}`);
             }
-            console.warn(`[Wireless ADB] Connect did not succeed for ${wirelessSerial}: ${output.trim()}`);
         } catch (e) {
             console.warn(`[Wireless ADB] Failed to connect ${wirelessSerial}: ${e.message}`);
         }
@@ -1029,14 +1183,14 @@ function getLaunchableApps(serial) {
     }
 }
 
-function setupWirelessAdb(serial, wifiDetails) {
+function setupWirelessAdb(serial, wifiDetails, options = {}) {
     if (!ENABLE_WIRELESS_ADB || !wifiDetails?.ip) {
         return;
     }
 
     const state = wirelessStateIndex[serial] || {};
     const lastSetupAt = Number(state.lastSetupAttemptAt || 0);
-    if ((Date.now() - lastSetupAt) < WIRELESS_SETUP_RETRY_MS) {
+    if (!options.force && (Date.now() - lastSetupAt) < WIRELESS_SETUP_RETRY_MS) {
         return;
     }
 
@@ -1060,6 +1214,7 @@ function setupWirelessAdb(serial, wifiDetails) {
 }
 
 function refreshDeviceRouting(allowWirelessSetup = true) {
+    collapseWirelessStateAliases();
     const adbDevices = listAdbDevicesDetailed().filter((entry) => ['device', 'unauthorized'].includes(entry.status));
     const justConnectedRoutes = [];
     const routes = new Map();
@@ -1132,7 +1287,12 @@ function refreshDeviceRouting(allowWirelessSetup = true) {
     for (const entry of adbDevices.filter((item) => item.serial.includes(':') && item.status === 'device')) {
         const ip = entry.serial.split(':')[0];
         const routeMatchedByIp = [...routes.values()].find((route) => route.ip === ip);
-        const resolvedStableSerial = routeMatchedByIp?.stableSerial || findStableSerialByWirelessIp(ip) || getDeviceStableSerial(entry.serial);
+        const liveStableSerial = getDeviceStableSerial(entry.serial);
+        const resolvedStableSerial =
+            routeMatchedByIp?.stableSerial ||
+            (liveStableSerial && !isTcpAdbSerial(liveStableSerial) ? liveStableSerial : null) ||
+            findStableSerialByWirelessIp(ip) ||
+            liveStableSerial;
         seenStableSerials.add(resolvedStableSerial);
         if (isIgnoredDevice(resolvedStableSerial)) {
             continue;
@@ -1169,6 +1329,9 @@ function refreshDeviceRouting(allowWirelessSetup = true) {
         rememberWirelessRoute(resolvedStableSerial, {
             ip,
             wirelessSerial: entry.serial,
+            usbSerial: existing?.usbSerial || wirelessStateIndex[resolvedStableSerial]?.usbSerial || null,
+            androidId: getDeviceAndroidId(entry.serial) || wirelessStateIndex[resolvedStableSerial]?.androidId || null,
+            model: getDeviceModel(entry.serial) || wirelessStateIndex[resolvedStableSerial]?.model || 'Meta Quest',
             hadSuccessfulWifiConnection: true,
         });
     }
@@ -1384,8 +1547,14 @@ function capturePngFrame(deviceSerial) {
     });
 }
 
-function streamDeviceFramesFallback(req, res, deviceSerial) {
+function streamDeviceFramesFallback(req, res, deviceSerial, options = {}) {
+    const startedAt = Date.now();
+    const boundary = options.boundary || 'frame';
+    const sourceLabel = options.sourceLabel || 'screencap';
     let closed = false;
+    let frameCount = 0;
+    let totalBytes = 0;
+    let firstFrameAt = null;
 
     const stopStream = () => {
         closed = true;
@@ -1394,60 +1563,117 @@ function streamDeviceFramesFallback(req, res, deviceSerial) {
     req.on('close', stopStream);
     req.on('aborted', stopStream);
 
-    res.writeHead(200, {
-        'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
-        'Cache-Control': 'no-store, no-cache, must-revalidate, private',
-        Connection: 'close',
-    });
+    if (!res.headersSent) {
+        const wroteHeaders = safeWriteHead(res, 200, {
+            'Content-Type': `multipart/x-mixed-replace; boundary=${boundary}`,
+            'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+            Connection: 'close',
+            'X-BizonVR-Cast-Transport': 'screencap',
+        });
+
+        if (!wroteHeaders) {
+            logHub('Cast', `Fallback could not start response for ${deviceSerial}`, {
+                source: sourceLabel,
+                reason: 'response_not_writable',
+            });
+            return safeEnd(res);
+        }
+    }
 
     const sendFrame = async () => {
-        if (closed) {
+        if (closed || !isResponseWritable(res)) {
             return;
         }
 
         const result = await capturePngFrame(deviceSerial);
         if (!result.success) {
-            if (!closed) {
-                res.write(`--frame\r\nContent-Type: application/json\r\n\r\n${JSON.stringify({
+            if (!closed && isResponseWritable(res)) {
+                safeWrite(res, `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify({
                     error: 'STREAM_CAPTURE_FAILED',
                     message: result.error,
                 })}\r\n`);
             }
             stopStream();
-            return res.end();
+            return safeEnd(res);
         }
 
         const frame = result.frame;
-        res.write(`--frame\r\nContent-Type: image/png\r\nContent-Length: ${frame.length}\r\n\r\n`);
-        res.write(frame);
-        res.write('\r\n');
+        frameCount += 1;
+        totalBytes += frame.length;
+        if (!firstFrameAt) {
+            firstFrameAt = Date.now();
+            logHub('Cast', `First fallback frame for ${deviceSerial} after ${firstFrameAt - startedAt}ms`, {
+                source: 'screencap',
+                frame_bytes: frame.length,
+            });
+        }
+
+        if (!safeWrite(res, `--${boundary}\r\nContent-Type: image/png\r\nContent-Length: ${frame.length}\r\n\r\n`)) {
+            stopStream();
+            return;
+        }
+        if (!safeWrite(res, frame)) {
+            stopStream();
+            return;
+        }
+        if (!safeWrite(res, '\r\n')) {
+            stopStream();
+            return;
+        }
 
         setTimeout(sendFrame, STREAM_FRAME_INTERVAL_MS);
     };
 
+    res.on('close', () => {
+        const elapsedMs = Math.max(Date.now() - startedAt, 1);
+        logHub('Cast', `Fallback stream closed for ${deviceSerial}`, {
+            source: sourceLabel,
+            frames: frameCount,
+            avg_frame_bytes: frameCount ? Math.round(totalBytes / frameCount) : 0,
+            throughput_kbps: Math.round((totalBytes * 8) / elapsedMs),
+        });
+    });
+
     sendFrame();
 }
 
-function stopProcess(proc, signal = 'SIGTERM') {
-    if (!proc || proc.killed) {
-        return;
+function streamDeviceFrames(req, res, deviceSerial, requestedTransport = STREAM_MODE, requestedProfile = STREAM_PROFILE) {
+    const streamRequest = resolveStreamRequest(requestedTransport, requestedProfile);
+    if (!streamRequest.ok) {
+        safeWriteHead(res, streamRequest.status, { 'Content-Type': 'application/json' });
+        return safeEnd(res, JSON.stringify(streamRequest.body));
     }
 
-    try {
-        proc.kill(signal);
-    } catch (e) {}
-}
-
-function streamDeviceFrames(req, res, deviceSerial, requestedMode = STREAM_MODE) {
-    const streamMode = ['mpjpeg', 'fmp4', 'screencap'].includes(requestedMode) ? requestedMode : STREAM_MODE;
+    const streamMode = streamRequest.transport;
+    const profile = getStreamProfile(streamRequest.profileKey);
     const executionSerial = resolveExecutionSerial(deviceSerial) || deviceSerial;
+    const activeStream = activeCastStreams.get(executionSerial);
+
+    if (activeStream) {
+        safeWriteHead(res, 409, { 'Content-Type': 'application/json' });
+        return safeEnd(res, JSON.stringify({
+            error: 'CAST_ALREADY_ACTIVE',
+            message: `A cast is already running for ${executionSerial}`,
+            active_transport: activeStream.transport,
+            active_profile: activeStream.profile,
+            next_step: 'Close the existing cast tab or wait for Local Hub to release the stream, then retry.',
+        }));
+    }
 
     wakeDeviceForCast(executionSerial);
 
     if (streamMode === 'screencap') {
+        screencapFallbackCount += 1;
+        logHub('Cast', `Starting explicit screencap cast for ${executionSerial}`, {
+            transport: streamMode,
+            profile: profile.key,
+            source: 'screencap',
+            fallback_count: screencapFallbackCount,
+        });
         return streamDeviceFramesFallback(req, res, executionSerial);
     }
 
+    const requestStartedAt = Date.now();
     let closed = false;
     let started = false;
     let bootTimer = null;
@@ -1455,63 +1681,39 @@ function streamDeviceFrames(req, res, deviceSerial, requestedMode = STREAM_MODE)
     let ffmpegExited = false;
     let fallbackStarted = false;
     let lastError = '';
+    let bytesOut = 0;
+    let chunkCount = 0;
+    let firstFrameAt = null;
 
-    const adbArgs = [
-        '-s', executionSerial,
-        'exec-out',
-        'screenrecord',
-        '--output-format=h264',
-        ...getScreenrecordDisplayArgs(executionSerial),
-        '--size', STREAM_VIDEO_SIZE,
-        '--bit-rate', STREAM_VIDEO_BITRATE,
-        '--time-limit', '0',
-        '-',
-    ];
-
-    const ffmpegArgs = streamMode === 'fmp4'
-        ? [
-            '-hide_banner',
-            '-loglevel', 'error',
-            '-f', 'h264',
-            '-i', 'pipe:0',
-            '-an',
-            '-c:v', 'copy',
-            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-            '-frag_duration', '100000',
-            '-f', 'mp4',
-            'pipe:1',
-        ]
-        : [
-            '-hide_banner',
-            '-loglevel', 'error',
-            '-f', 'h264',
-            '-i', 'pipe:0',
-            '-vf', `fps=${STREAM_VIDEO_FPS}`,
-            '-pix_fmt', 'yuvj420p',
-            '-an',
-            '-c:v', 'mjpeg',
-            '-strict', 'unofficial',
-            '-q:v', String(STREAM_JPEG_QUALITY),
-            '-threads', '1',
-            '-f', 'mpjpeg',
-            'pipe:1',
-        ];
+    const adbArgs = buildAdbScreenrecordArgs(executionSerial, profile, getScreenrecordDisplayArgs(executionSerial));
+    const ffmpegArgs = buildFfmpegArgs(streamMode, profile);
 
     const adbProc = spawn('adb', adbArgs);
     const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
-
-    const cleanup = () => {
+    const clearBootTimer = () => {
         if (bootTimer) {
             clearTimeout(bootTimer);
             bootTimer = null;
         }
-        stopProcess(adbProc);
-        stopProcess(ffmpegProc);
     };
+    const stopper = createStreamStopper({
+        adbProc,
+        ffmpegProc,
+        clearBootTimer,
+        onStop: (reason) => {
+            activeCastStreams.delete(executionSerial);
+            logHub('Cast', `Stopped stream for ${executionSerial}`, {
+                reason,
+                transport: streamMode,
+                profile: profile.key,
+                source: 'adb-screenrecord',
+            });
+        },
+    });
 
     const stopStream = () => {
         closed = true;
-        cleanup();
+        stopper.stop('client_disconnect');
     };
 
     const fallbackToScreenshots = () => {
@@ -1520,9 +1722,33 @@ function streamDeviceFrames(req, res, deviceSerial, requestedMode = STREAM_MODE)
         }
 
         fallbackStarted = true;
-        cleanup();
+        screencapFallbackCount += 1;
+        stopper.stop('fallback_to_screencap');
         console.warn(`[Local Hub] Falling back to screenshot cast for ${executionSerial}: ${lastError || 'video pipeline did not start'}`);
-        streamDeviceFramesFallback(req, res, executionSerial);
+        logHub('Cast', `Falling back to screencap for ${executionSerial}`, {
+            transport: streamMode,
+            profile: profile.key,
+            source: 'adb-screenrecord',
+            fallback_count: screencapFallbackCount,
+            error: lastError || 'video pipeline did not start',
+        });
+        const fallbackStrategy = getFallbackResponseStrategy(res);
+        if (fallbackStrategy === 'abandon') {
+            return;
+        }
+        if (fallbackStrategy === 'close') {
+            logHub('Cast', `Closing current response before screencap fallback for ${executionSerial}`, {
+                transport: streamMode,
+                profile: profile.key,
+                reason: 'headers_already_sent',
+            });
+            safeEnd(res);
+            return;
+        }
+        streamDeviceFramesFallback(req, res, executionSerial, {
+            boundary: 'frame',
+            sourceLabel: 'screencap-fallback',
+        });
     };
 
     req.on('close', stopStream);
@@ -1532,10 +1758,20 @@ function streamDeviceFrames(req, res, deviceSerial, requestedMode = STREAM_MODE)
 
     adbProc.stderr.on('data', (chunk) => {
         lastError += chunk.toString();
+        logHub('Cast', `adb screenrecord stderr for ${executionSerial}`, {
+            transport: streamMode,
+            profile: profile.key,
+            stderr: chunk.toString(),
+        });
     });
 
     ffmpegProc.stderr.on('data', (chunk) => {
         lastError += chunk.toString();
+        logHub('Cast', `ffmpeg stderr for ${executionSerial}`, {
+            transport: streamMode,
+            profile: profile.key,
+            stderr: chunk.toString(),
+        });
     });
 
     adbProc.on('error', (err) => {
@@ -1553,43 +1789,110 @@ function streamDeviceFrames(req, res, deviceSerial, requestedMode = STREAM_MODE)
             return;
         }
 
+        bytesOut += chunk.length;
+        chunkCount += 1;
         if (!started) {
             started = true;
-            if (bootTimer) {
-                clearTimeout(bootTimer);
-                bootTimer = null;
-            }
+            clearBootTimer();
+            firstFrameAt = Date.now();
 
-            res.writeHead(200, {
+            const wroteHeaders = safeWriteHead(res, 200, {
                 'Content-Type': streamMode === 'fmp4' ? 'video/mp4' : 'multipart/x-mixed-replace; boundary=ffmpeg',
                 'Cache-Control': 'no-store, no-cache, must-revalidate, private',
                 'Accept-Ranges': 'none',
                 Connection: 'close',
+                'X-BizonVR-Cast-Transport': streamMode,
+                'X-BizonVR-Cast-Profile': profile.key,
+            });
+            if (!wroteHeaders) {
+                lastError = lastError || 'Failed to send stream headers';
+                closed = true;
+                stopper.stop('response_header_failure');
+                return;
+            }
+            logHub('Cast', `First stream bytes for ${executionSerial} after ${firstFrameAt - requestStartedAt}ms`, {
+                transport: streamMode,
+                profile: profile.key,
+                source: 'adb-screenrecord',
+                output_resolution: profile.size,
+                target_fps: profile.fps,
+                target_bitrate: profile.bitrate,
             });
         }
 
-        res.write(chunk);
+        if (!safeWrite(res, chunk)) {
+            closed = true;
+            stopper.stop('response_write_failure');
+        }
     });
 
-    adbProc.on('close', () => {
+    adbProc.on('close', (code, signal) => {
         adbExited = true;
+        logHub('Cast', `adb screenrecord exited for ${executionSerial}`, {
+            transport: streamMode,
+            profile: profile.key,
+            exit_code: code,
+            signal,
+            stderr: lastError || null,
+            route: executionSerial,
+        });
         if (!started) {
             fallbackToScreenshots();
         } else if (ffmpegExited && !closed) {
-            res.end();
+            safeEnd(res);
         }
     });
 
-    ffmpegProc.on('close', () => {
+    ffmpegProc.on('close', (code, signal) => {
         ffmpegExited = true;
+        logHub('Cast', `ffmpeg exited for ${executionSerial}`, {
+            transport: streamMode,
+            profile: profile.key,
+            exit_code: code,
+            signal,
+            stderr: lastError || null,
+            ffmpeg_args: ffmpegArgs,
+        });
         if (!started) {
             fallbackToScreenshots();
         } else if (adbExited && !closed) {
-            res.end();
+            safeEnd(res);
         }
     });
 
+    activeCastStreams.set(executionSerial, {
+        transport: streamMode,
+        profile: profile.key,
+        startedAt: requestStartedAt,
+    });
+    logHub('Cast', `Starting cast for ${executionSerial}`, {
+        transport: streamMode,
+        profile: profile.key,
+        source: 'adb-screenrecord',
+        route: executionSerial,
+        output_resolution: profile.size,
+        target_fps: profile.fps,
+        target_bitrate: profile.bitrate,
+        adb_args: adbArgs,
+        ffmpeg_args: ffmpegArgs,
+    });
+
+    req.on('close', () => {
+        const elapsedMs = Math.max(Date.now() - requestStartedAt, 1);
+        logHub('Cast', `Client disconnected from ${executionSerial}`, {
+            transport: streamMode,
+            profile: profile.key,
+            first_frame_latency_ms: firstFrameAt ? firstFrameAt - requestStartedAt : null,
+            output_chunks: chunkCount,
+            output_bytes: bytesOut,
+            avg_chunk_bytes: chunkCount ? Math.round(bytesOut / chunkCount) : 0,
+            throughput_kbps: Math.round((bytesOut * 8) / elapsedMs),
+            errors: lastError || null,
+        });
+    });
+
     bootTimer = setTimeout(() => {
+        lastError = lastError || `No ${streamMode} bytes were produced within ${STREAM_BOOT_TIMEOUT_MS}ms`;
         fallbackToScreenshots();
     }, STREAM_BOOT_TIMEOUT_MS);
 }
@@ -1627,6 +1930,8 @@ function buildAgentStartArgs(deviceSerial, options = {}) {
     const args = [
         '-s', deviceSerial,
         'shell', 'am', 'start',
+        '-a', 'android.intent.action.MAIN',
+        '-c', 'com.oculus.intent.category.VR',
         '-n', buildAgentComponent(),
         '--es', 'HUB_IP', connection.host,
         '--ei', 'HUB_PORT', connection.port,
@@ -1643,6 +1948,36 @@ function buildAgentStartArgs(deviceSerial, options = {}) {
     }
     if (options.duration !== undefined) {
         args.push('--ei', 'DURATION', Number(options.duration));
+    }
+    if (options.sessionState && typeof options.sessionState === 'object') {
+        const state = options.sessionState;
+        if (state.session_id !== undefined && state.session_id !== null) {
+            args.push('--ei', 'SESSION_ID', Number(state.session_id));
+        }
+        if (state.remaining_seconds !== undefined && state.remaining_seconds !== null) {
+            args.push('--ei', 'REMAINING_SECONDS', Number(state.remaining_seconds));
+        }
+        if (state.duration_seconds !== undefined && state.duration_seconds !== null) {
+            args.push('--ei', 'DURATION_SECONDS', Number(state.duration_seconds));
+        }
+        if (state.current_app_package) {
+            args.push('--es', 'CURRENT_APP_PACKAGE', String(state.current_app_package));
+        }
+        if (state.current_app_name) {
+            args.push('--es', 'CURRENT_APP_NAME', String(state.current_app_name));
+        }
+        if (state.app_name) {
+            args.push('--es', 'APP_NAME', String(state.app_name));
+        }
+        if (state.session_status) {
+            args.push('--es', 'SESSION_STATUS', String(state.session_status));
+        }
+        if (state.paused !== undefined) {
+            args.push('--ez', 'PAUSED', Boolean(state.paused));
+        }
+    }
+    if (options.autoLaunch !== undefined) {
+        args.push('--ez', 'AUTO_LAUNCH', Boolean(options.autoLaunch));
     }
 
     return args;
@@ -1755,6 +2090,7 @@ function runCommand(deviceSerial, commandType, payloadStr) {
         const pkg = payload.package || QUEST_AGENT_PACKAGE;
         const activity = payload.activity || resolveLaunchComponent(deviceSerial, pkg);
         const duration = payload.duration_minutes || 30;
+        const sessionState = payload.session_state || null;
         
         logHub('Session', `Notifying Agent to start session on ${adbRoute}`, { pkg, activity, duration });
         wakeDevice(stableSerial).then((wakeRes) => {
@@ -1767,6 +2103,8 @@ function runCommand(deviceSerial, commandType, payloadStr) {
                 pkg,
                 activity,
                 duration,
+                sessionState,
+                autoLaunch: false,
             }), `Agent notified for ${pkg}`)
                 .then(async (res) => {
                     if (!res.success) {
@@ -1786,6 +2124,83 @@ function runCommand(deviceSerial, commandType, payloadStr) {
                 });
         }).catch((err) => resolve({ success: false, error: err.message }));
 
+     } else if (commandType === 'PAUSE_SESSION') {
+        const pkg = payload.package || payload.current_app_package;
+        const finishWithLauncher = () => spawnAdb(buildAgentStartArgs(adbRoute, {
+            action: 'PAUSE',
+            pkg,
+            sessionState: payload.session_state || null,
+            autoLaunch: false,
+        }), 'Session paused in Agent').then(resolve);
+
+        if (!pkg || !isValidPackage(pkg)) {
+            return finishWithLauncher();
+        }
+
+        const stop = spawn('adb', ['-s', adbRoute, 'shell', 'am', 'force-stop', pkg]);
+        let stderr = '';
+        stop.stderr?.on('data', (chunk) => {
+            stderr += chunk.toString();
+        });
+        stop.on('close', (code) => {
+           if (code !== 0) {
+               return resolve({ success: false, error: stderr.trim() || `force-stop exited with code ${code}` });
+           }
+           finishWithLauncher();
+        });
+        stop.on('error', (err) => resolve({ success: false, error: err.message }));
+
+     } else if (commandType === 'RESUME_SESSION') {
+        const pkg = payload.current_app_package || payload.package || QUEST_AGENT_PACKAGE;
+        const activity = payload.activity || resolveLaunchComponent(deviceSerial, pkg);
+        logHub('Session', `Resuming session on ${adbRoute}`, { pkg, activity });
+        return spawnAdb(buildAgentStartArgs(adbRoute, {
+            action: 'RESUME',
+            pkg,
+            activity,
+            sessionState: payload.session_state || null,
+            autoLaunch: false,
+        }), `Agent resumed session for ${pkg}`)
+            .then(async (res) => {
+                if (!res.success) {
+                    return resolve(res);
+                }
+                if (!activity) {
+                    return resolve({
+                        success: false,
+                        error: `Launch activity not found for ${pkg}`,
+                    });
+                }
+                const launchRes = await startAppComponent(adbRoute, activity);
+                resolve(launchRes.success ? res : launchRes);
+            });
+
+     } else if (commandType === 'SWITCH_SESSION_APP') {
+        const pkg = payload.package || payload.current_app_package;
+        const activity = payload.activity || resolveLaunchComponent(deviceSerial, pkg);
+        const launchImmediately = Boolean(payload.launch_immediately);
+        logHub('Session', `Switching session app on ${adbRoute}`, { pkg, activity, launchImmediately });
+        return spawnAdb(buildAgentStartArgs(adbRoute, {
+            action: launchImmediately ? 'SWITCH' : 'SYNC',
+            pkg,
+            activity,
+            sessionState: payload.session_state || null,
+            autoLaunch: false,
+        }), `Agent synced session app ${pkg}`)
+            .then(async (res) => {
+                if (!res.success || !launchImmediately) {
+                    return resolve(res);
+                }
+                if (!activity) {
+                    return resolve({
+                        success: false,
+                        error: `Launch activity not found for ${pkg}`,
+                    });
+                }
+                const launchRes = await startAppComponent(adbRoute, activity);
+                resolve(launchRes.success ? res : launchRes);
+            });
+
      } else if (commandType === 'END_SESSION') {
         const pkg = payload.package;
         if (!isValidPackage(pkg)) return resolve({ success: false, error: "Invalid package name" });
@@ -1803,7 +2218,11 @@ function runCommand(deviceSerial, commandType, payloadStr) {
            }
            // Wait a second then launch the club launcher setting the intent action to stop
            setTimeout(() => {
-               spawnAdb(buildAgentStartArgs(adbRoute, { action: 'STOP' }), "Session ended, launcher started")
+               spawnAdb(buildAgentStartArgs(adbRoute, {
+                   action: 'STOP',
+                   sessionState: payload.session_state || null,
+                   autoLaunch: false,
+               }), "Session ended, launcher started")
                   .then(resolve);
            }, 1000);
         });
@@ -1881,7 +2300,7 @@ function runCommand(deviceSerial, commandType, payloadStr) {
                     model: getDeviceModel(usbSerial),
                     knownDevice: true,
                 });
-                setupWirelessAdb(usbSerial, wifiDetails);
+                setupWirelessAdb(usbSerial, wifiDetails, { force: true });
                 setTimeout(() => resolve({ success: true, message: "USB repair started. Local Hub will reconnect Wi-Fi ADB." }), 1200);
             } catch (e) {
                 resolve({ success: false, error: `USB repair failed: ${e.message}` });
@@ -2215,7 +2634,13 @@ const localServer = http.createServer((req, res) => {
             }));
         }
 
-        return streamDeviceFrames(req, res, serial, streamUrl.searchParams.get('transport') || STREAM_MODE);
+        return streamDeviceFrames(
+            req,
+            res,
+            serial,
+            streamUrl.searchParams.get('transport') || STREAM_MODE,
+            streamUrl.searchParams.get('profile') || STREAM_PROFILE,
+        );
     }
 
     if (req.method === 'POST' && req.url === '/api/agent/heartbeat') {

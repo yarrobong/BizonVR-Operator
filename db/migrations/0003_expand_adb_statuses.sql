@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS devices_v2 (
       'unknown_error'
     )
   ),
-  adb_status TEXT NOT NULL DEFAULT 'unknown' CHECK (adb_status IN ('unknown', 'online', 'offline', 'reconnecting', 'unauthorized', 'tcpip_unavailable', 'port_closed', 'unavailable')),
+  adb_status TEXT NOT NULL DEFAULT 'unknown' CHECK (adb_status IN ('unknown', 'online', 'offline', 'reconnecting', 'unauthorized', 'tcpip_unavailable', 'port_closed', 'different_device', 'unavailable')),
   agent_status TEXT NOT NULL DEFAULT 'unknown' CHECK (agent_status IN ('unknown', 'online', 'offline', 'missing', 'error')),
   battery_percent INTEGER NOT NULL DEFAULT 100,
   is_charging INTEGER NOT NULL DEFAULT 0 CHECK (is_charging IN (0, 1)),

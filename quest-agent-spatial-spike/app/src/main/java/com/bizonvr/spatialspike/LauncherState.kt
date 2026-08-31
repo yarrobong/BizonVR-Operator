@@ -4,6 +4,7 @@ enum class LauncherState {
     WAITING,
     STARTING,
     ACTIVE,
+    PAUSED,
     FIVE_MIN_WARN,
     FINISHED,
     ERROR

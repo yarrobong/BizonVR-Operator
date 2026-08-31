@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { PlayCircle, RefreshCw, Battery, Plus, MonitorSmartphone, Radio, TriangleAlert, X, Power, Wifi, Cable, Wrench, Stethoscope, Trash2 } from "lucide-react";
+import { canRepairWireless, getCastAvailability, getConnectivityLabel, getOperatorStatus, getResolvedConnectionStatus, hasUsbRoute, isReadyForWirelessControl } from "../lib/operatorStatus";
 
 type Device = {
   id: number;
@@ -33,23 +34,12 @@ type Device = {
   adb_recovery_permission?: string | null;
   room_id?: number | null;
   room_name?: string | null;
+  needs_help?: number;
 };
 
 type Room = {
   id: number;
   name: string;
-};
-
-type CastInfo = {
-  stream_url: string;
-  device: Device;
-  hub: {
-    id: number;
-    name: string;
-    status: string;
-    host: string;
-    port: number;
-  };
 };
 
 type ApiState = "permission_denied" | "subscription_blocked" | "partial_offline" | "command_failed" | "preflight_failed";
@@ -94,56 +84,29 @@ function getNoticeTone(state: ApiState) {
   return "border-red-400/40 bg-red-500/10 text-red-100";
 }
 
-function getResolvedConnectionStatus(device: Device) {
-  if (device.connection_status) {
-    return device.connection_status;
+function getConnectivityTone(device: Device) {
+  const connectionStatus = getResolvedConnectionStatus(device);
+  if (connectionStatus === "online" || connectionStatus === "wifi_ready") {
+    return "bg-emerald-500/10 text-emerald-300 border-emerald-500/30";
   }
-  if (device.adb_status === "unauthorized") {
-    return "usb_unauthorized";
+  if (connectionStatus === "usb_repair_required" || connectionStatus === "vpn_or_lan_blocked" || device.usb_repair_required) {
+    return "bg-amber-500/10 text-amber-200 border-amber-500/30";
   }
-  if (device.adb_status === "online" && device.agent_status === "online") {
-    return "online";
+  if (connectionStatus === "usb_unauthorized" || connectionStatus === "new") {
+    return "bg-red-500/10 text-red-200 border-red-500/30";
   }
-  if (device.adb_status === "online" && device.wifi_ready) {
-    return "wifi_ready";
-  }
-  if (device.adb_status === "online") {
-    return "adb_online_agent_offline";
-  }
-  if (device.agent_status === "online") {
-    return "agent_online_adb_offline";
-  }
-  if (device.usb_repair_required) {
-    return "usb_repair_required";
-  }
-  return device.status ?? "unknown_error";
-}
-
-function getAdbDegradedLabel(device: Device) {
-  switch (device.adb_status) {
-    case "reconnecting":
-      return "Online, ADB reconnecting";
-    case "tcpip_unavailable":
-      return "Online, wireless ADB off";
-    case "port_closed":
-      return "Online, port 5555 closed";
-    case "unauthorized":
-      return "USB Authorize";
-    default:
-      return "Online, ADB degraded";
-  }
+  return "bg-blue-500/10 text-blue-200 border-blue-500/30";
 }
 
 export function Devices() {
   const queryClient = useQueryClient();
-  const [selectedDevice, setSelectedDevice] = useState<Device | null>(null);
-  const [streamState, setStreamState] = useState<"idle" | "loading" | "ready" | "error">("idle");
-  const [streamError, setStreamError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<ActionNotice | null>(null);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [pairingDeviceId, setPairingDeviceId] = useState<number | null>(null);
   const [pairingRoomId, setPairingRoomId] = useState<number | null>(null);
   const [healthCheckResult, setHealthCheckResult] = useState<HealthCheckResult | null>(null);
+  const [repairingDeviceId, setRepairingDeviceId] = useState<number | null>(null);
+  const [recentlyRecoveredDeviceId, setRecentlyRecoveredDeviceId] = useState<number | null>(null);
 
   const { data: devices, isLoading } = useQuery({
     queryKey: ['devices'],
@@ -221,14 +184,19 @@ export function Devices() {
 
   const repairDevice = useMutation({
     mutationFn: async (deviceId: number) => {
+      setRepairingDeviceId(deviceId);
+      setRecentlyRecoveredDeviceId(null);
       const res = await fetch(`/api/devices/${deviceId}/repair`, { method: 'POST' });
       return readApiResponse(res);
     },
-    onSuccess: () => {
+    onSuccess: (_, deviceId) => {
       setActionNotice({ state: "partial_offline", message: "USB Repair started. Local Hub is refreshing the Wi-Fi ADB route for the known Quest." });
       queryClient.invalidateQueries({ queryKey: ['devices'] });
     },
-    onError: (error) => setActionNotice(noticeFromError(error, "USB Repair failed")),
+    onError: (error) => {
+      setRepairingDeviceId(null);
+      setActionNotice(noticeFromError(error, "USB Repair failed"));
+    },
   });
 
   const runHealthCheck = useMutation({
@@ -251,96 +219,48 @@ export function Devices() {
     onSuccess: () => {
       setActionNotice({ state: "partial_offline", message: "Quest removal queued. Local Hub will forget remembered routes and the headset will disappear from inventory after sync." });
       queryClient.invalidateQueries({ queryKey: ['devices'] });
-      if (selectedDevice && !knownDevices.find((device) => device.id === selectedDevice.id)) {
-        setSelectedDevice(null);
-      }
     },
     onError: (error) => setActionNotice(noticeFromError(error, "Quest removal failed")),
   });
 
-  const castQuery = useQuery<CastInfo>({
-    queryKey: ['device-cast', selectedDevice?.id],
-    enabled: !!selectedDevice,
-    retry: false,
-    queryFn: async () => {
-      if (!selectedDevice) {
-        throw new Error('Device is not selected');
-      }
-
-      const res = await fetch(`/api/devices/${selectedDevice.id}/cast`);
+  const dismissHelp = useMutation({
+    mutationFn: async (deviceId: number) => {
+      const res = await fetch(`/api/devices/${deviceId}/dismiss_help`, { method: "POST" });
       return readApiResponse(res);
     },
+    onSuccess: () => {
+      setActionNotice(null);
+      queryClient.invalidateQueries({ queryKey: ["devices"] });
+    },
+    onError: (error) => setActionNotice(noticeFromError(error, "Dismiss help request failed")),
   });
 
-  useEffect(() => {
-    if (!castQuery.data?.stream_url) return;
-
-    setStreamState("ready");
-    setStreamError(null);
-  }, [castQuery.data?.stream_url]);
-
   const openCast = (device: Device) => {
-    setSelectedDevice(device);
-    setStreamState("loading");
-    setStreamError(null);
+    window.open(`/cast/${device.id}`, "_blank", "noopener,noreferrer");
   };
-
-  const closeCast = () => {
-    setSelectedDevice(null);
-    setStreamState("idle");
-    setStreamError(null);
-  };
-
-  const getConnectivityTone = (device: Device) => {
-    const connectionStatus = getResolvedConnectionStatus(device);
-    if (connectionStatus === "online" || connectionStatus === "wifi_ready") {
-      return "bg-emerald-500/10 text-emerald-300 border-emerald-500/30";
-    }
-    if (connectionStatus === "usb_repair_required" || connectionStatus === "vpn_or_lan_blocked" || device.usb_repair_required) {
-      return "bg-amber-500/10 text-amber-200 border-amber-500/30";
-    }
-    if (connectionStatus === "usb_unauthorized" || connectionStatus === "new") {
-      return "bg-red-500/10 text-red-200 border-red-500/30";
-    }
-    return "bg-blue-500/10 text-blue-200 border-blue-500/30";
-  };
-
-  const getConnectivityLabel = (device: Device) => {
-    switch (getResolvedConnectionStatus(device)) {
-      case "online":
-        return "Online";
-      case "wifi_ready":
-        return "Wi-Fi Ready";
-      case "usb_unauthorized":
-        return "USB Authorize";
-      case "usb_repair_required":
-        return "USB Repair";
-      case "vpn_or_lan_blocked":
-        return "VPN/LAN Blocked";
-      case "agent_online_adb_offline":
-        return getAdbDegradedLabel(device);
-      case "adb_online_agent_offline":
-        return "Agent offline, relaunching";
-      case "offline_sleeping":
-        return "Sleeping or unreachable";
-      case "pairing_in_progress":
-        return "Pairing";
-      case "new":
-        return "New Quest";
-      default:
-        return device.usb_repair_required ? "USB Repair" : "Checking";
-    }
-  };
-
-  if (isLoading) return <div className="p-6 text-sm text-slate-400">Loading devices...</div>;
 
   const knownDevices = Array.isArray(devices) ? devices as Device[] : [];
+
+  useEffect(() => {
+    if (!repairingDeviceId) {
+      return;
+    }
+    const recovered = knownDevices.find((device) => device.id === repairingDeviceId && isReadyForWirelessControl(device));
+    if (recovered) {
+      setRepairingDeviceId(null);
+      setRecentlyRecoveredDeviceId(recovered.id);
+      setActionNotice({ state: "partial_offline", message: "Wi-Fi ADB restored. You can disconnect USB now." });
+    }
+  }, [knownDevices, repairingDeviceId]);
+
+  if (isLoading) return <div className="p-6 text-sm text-slate-400">Loading devices...</div>;
   const addCandidates = knownDevices.filter((device) => {
     const connectionStatus = String(getResolvedConnectionStatus(device));
     const needsRoomAssignment = !device.room_id;
     return needsRoomAssignment && ["new", "usb_unauthorized", "pairing_in_progress", "wifi_ready", "adb_online_agent_offline"].includes(connectionStatus);
   });
   const partialOffline = knownDevices.some((device: Device) => ["offline", "vpn_or_lan_blocked", "usb_repair_required", "agent_online_adb_offline", "adb_online_agent_offline"].includes(String(getResolvedConnectionStatus(device))) || device.adb_status === "offline" || device.usb_repair_required);
+  const helpRequests = knownDevices.filter((device) => device.needs_help === 1);
   const visibleNotice = actionNotice ?? (partialOffline
     ? { state: "partial_offline" as const, message: "Some Quest headsets are partially offline. Use USB repair or wake over Wi-Fi before starting sessions." }
     : null);
@@ -369,6 +289,15 @@ export function Devices() {
         </div>
       )}
 
+      {helpRequests.length > 0 && (
+        <div className="mb-4 border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-50">
+          <div className="font-black uppercase tracking-[0.2em] text-red-200">Operator Call</div>
+          <div className="mt-1">
+            {helpRequests.map((device) => device.name).join(", ")} {helpRequests.length === 1 ? "ждет" : "ждут"} оператора.
+          </div>
+        </div>
+      )}
+
       <div className="bg-[#16191E] border border-[#2D3139] overflow-hidden flex-1">
         <table className="min-w-full divide-y divide-[#2D3139]">
           <thead className="bg-[#1C2128]">
@@ -385,6 +314,12 @@ export function Devices() {
               <tr key={dev.id} className="hover:bg-[#1C2128] transition-colors group">
                 {(() => {
                   const connectionStatus = getResolvedConnectionStatus(dev);
+                  const castAvailability = getCastAvailability(dev);
+                  const isHelpRequested = dev.needs_help === 1;
+                  const operatorStatus = getOperatorStatus(dev, {
+                    repairPending: repairingDeviceId === dev.id || (repairDevice.isPending && repairDevice.variables === dev.id),
+                    recentlyRecovered: recentlyRecoveredDeviceId === dev.id,
+                  });
                   return (
                     <>
                 <td className="px-6 py-4 whitespace-nowrap">
@@ -395,6 +330,9 @@ export function Devices() {
                     <div>
                       <div className="text-sm font-black italic uppercase text-slate-200">{dev.name}</div>
                       <div className="text-[10px] font-mono text-slate-500 uppercase leading-none mt-1">S/N: {dev.serial_number}</div>
+                      {isHelpRequested && (
+                        <div className="mt-2 text-[10px] font-black uppercase tracking-[0.18em] text-red-300">Игрок вызвал оператора</div>
+                      )}
                       {dev.wifi_ssid && (
                         <div className="mt-2 text-[10px] uppercase tracking-[0.2em] text-slate-500">{dev.wifi_ssid}</div>
                       )}
@@ -402,8 +340,8 @@ export function Devices() {
                   </div>
                 </td>
                 <td className="px-6 py-4 whitespace-nowrap">
-                  <span className={`px-2 py-1 text-[10px] font-bold uppercase tracking-tight ${connectionStatus === 'online' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-slate-800 text-slate-300'}`}>
-                    {connectionStatus}
+                  <span className={`px-2 py-1 text-[10px] font-bold uppercase tracking-tight ${operatorStatus.tone}`}>
+                    {operatorStatus.chip}
                   </span>
                 </td>
                 <td className="px-6 py-4 whitespace-nowrap">
@@ -413,31 +351,53 @@ export function Devices() {
                   </div>
                 </td>
                 <td className="px-6 py-4">
-                  <div className={`inline-flex items-center gap-2 border px-2 py-1 text-[10px] font-bold uppercase tracking-[0.18em] ${getConnectivityTone(dev)}`}>
-                    {connectionStatus === "online" || connectionStatus === "wifi_ready" ? <Wifi className="h-3.5 w-3.5" /> : <Cable className="h-3.5 w-3.5" />}
-                    <span>{getConnectivityLabel(dev)}</span>
+                  <div className={`border px-3 py-3 ${operatorStatus.tone}`}>
+                    <div className="text-[10px] font-bold uppercase tracking-[0.18em]">{operatorStatus.chip}</div>
+                    <p className="mt-1 text-sm font-semibold text-white">{operatorStatus.title}</p>
+                    <p className="mt-2 max-w-[20rem] text-[12px] leading-5 text-inherit">{operatorStatus.message}</p>
+                    {operatorStatus.secondary && (
+                      <p className="mt-2 max-w-[20rem] text-[12px] leading-5 text-inherit/90">{operatorStatus.secondary}</p>
+                    )}
+                    {operatorStatus.showRepair && (
+                      <button
+                        onClick={() => repairDevice.mutate(dev.id)}
+                        disabled={repairingDeviceId === dev.id}
+                        className="mt-3 inline-flex items-center gap-2 border border-amber-300/30 bg-amber-400/10 px-3 py-2 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-50 transition-colors hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        <Wrench className="h-3.5 w-3.5" />
+                        <span>Восстановить Wi-Fi ADB</span>
+                      </button>
+                    )}
+                    {isHelpRequested && (
+                      <button
+                        onClick={() => dismissHelp.mutate(dev.id)}
+                        className="mt-3 inline-flex items-center gap-2 border border-red-300/30 bg-red-500/10 px-3 py-2 text-[10px] font-bold uppercase tracking-[0.18em] text-red-50 transition-colors hover:bg-red-500/20"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                        <span>Dismiss Help Alert</span>
+                      </button>
+                    )}
                   </div>
-                  <p className="mt-2 max-w-[20rem] text-[11px] leading-4 text-slate-400">
+                  {dev.wifi_ip && (
+                    <p className="mt-2 text-[11px] text-slate-400">
+                      IP шлема: <span className="font-mono text-slate-300">{dev.wifi_ip}</span>
+                      {dev.ip_changed ? " (обновлён)" : ""}
+                    </p>
+                  )}
+                  <details className="mt-3 border border-[#2D3139] bg-[#11141A] px-3 py-2 text-[11px] text-slate-400">
+                    <summary className="cursor-pointer list-none font-semibold text-slate-300">Техническая информация</summary>
+                    <div className="mt-3 grid gap-1 font-mono text-[10px] text-slate-500">
+                      <span>device: {dev.device_status || dev.status} / agent: {dev.agent_status || "unknown"} / adb: {dev.adb_status || "unknown"}</span>
+                      <span>route: {dev.active_route || dev.serial_number}</span>
+                      <span>last known ip: {dev.wifi_ip || "unknown"}</span>
+                      <span>android id: {dev.android_id || "unknown"}</span>
+                      <span>heartbeat: {dev.last_heartbeat_at || "never"} / adb seen: {dev.last_adb_seen_at || "never"}</span>
+                      <span>agent version: {dev.agent_version || "unknown"}</span>
+                    </div>
+                  </details>
+                  <p className="mt-2 max-w-[20rem] text-[11px] leading-4 text-slate-500">
                     {dev.status_reason || 'Local Hub has not reported Wi-Fi ADB diagnostics yet.'}
                   </p>
-                  {dev.next_operator_step && (
-                    <p className="mt-2 max-w-[20rem] text-[11px] leading-4 text-blue-200">
-                      Next: {dev.next_operator_step}
-                    </p>
-                  )}
-                  {dev.wifi_ip && (
-                    <p className="mt-1 font-mono text-[10px] text-slate-500">
-                      {dev.transport === 'wifi' ? 'wifi' : 'ip'}: {dev.wifi_ip}
-                      {dev.ip_changed ? ' (updated)' : ''}
-                    </p>
-                  )}
-                  <div className="mt-2 grid gap-1 font-mono text-[10px] text-slate-500">
-                    <span>device: {dev.device_status || dev.status} / agent: {dev.agent_status || "unknown"} / adb: {dev.adb_status || "unknown"}</span>
-                    <span>recovery: {dev.adb_recovery_status || "idle"} / permission: {dev.adb_recovery_permission || "missing"}</span>
-                    <span>route: {dev.active_route || dev.serial_number}</span>
-                    <span>heartbeat: {dev.last_heartbeat_at || "never"} / adb seen: {dev.last_adb_seen_at || "never"}</span>
-                    <span>agent version: {dev.agent_version || "unknown"}</span>
-                  </div>
                 </td>
                 <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                    <button 
@@ -463,14 +423,16 @@ export function Devices() {
                    >
                      <Radio className="w-4 h-4" />
                    </button>
-                   <button 
-                     onClick={() => repairDevice.mutate(dev.id)}
-                     disabled={!["usb_repair_required", "vpn_or_lan_blocked", "agent_online_adb_offline"].includes(connectionStatus)}
-                     className="text-slate-400 hover:text-amber-300 mx-2 inline-flex items-center transition-colors px-2 py-1 border border-transparent hover:border-amber-400/30 bg-transparent hover:bg-amber-500/10 disabled:cursor-not-allowed disabled:opacity-30"
-                     title="USB Repair"
-                   >
-                     <Wrench className="w-4 h-4" />
-                   </button>
+                   {canRepairWireless(dev) && (
+                     <button
+                       onClick={() => repairDevice.mutate(dev.id)}
+                       disabled={!hasUsbRoute(dev) || repairingDeviceId === dev.id}
+                       className="text-slate-400 hover:text-amber-300 mx-2 inline-flex items-center transition-colors px-2 py-1 border border-transparent hover:border-amber-400/30 bg-transparent hover:bg-amber-500/10 disabled:cursor-not-allowed disabled:opacity-30"
+                       title="USB Repair"
+                     >
+                       <Wrench className="w-4 h-4" />
+                     </button>
+                   )}
                    <button 
                      onClick={() => sendCommand.mutate({ deviceId: dev.id, type: 'REFRESH_STATUS' })}
                      className="text-slate-400 hover:text-blue-400 mx-2 inline-flex items-center transition-colors px-2 py-1 border border-transparent hover:border-blue-500/30 bg-transparent hover:bg-blue-500/10"
@@ -488,9 +450,9 @@ export function Devices() {
                    </button>
                    <button 
                      onClick={() => openCast(dev)}
-                     disabled={dev.adb_status !== "online"}
+                     disabled={!castAvailability.enabled}
                      className="text-slate-400 hover:text-emerald-400 mx-2 inline-flex items-center transition-colors px-2 py-1 border border-transparent hover:border-emerald-500/30 bg-transparent hover:bg-emerald-500/10 disabled:cursor-not-allowed disabled:opacity-30"
-                     title="Open Cast In Panel"
+                     title={castAvailability.reason}
                    >
                      <PlayCircle className="w-4 h-4" />
                    </button>
@@ -603,106 +565,6 @@ export function Devices() {
         </div>
       )}
       </div>
-
-      <aside className="flex w-[26rem] shrink-0 flex-col border border-[#2D3139] bg-[#16191E]">
-        <div className="flex items-center justify-between border-b border-[#2D3139] px-5 py-4">
-          <div>
-            <div className="text-[10px] font-bold uppercase tracking-[0.3em] text-slate-500">Web Cast</div>
-            <h2 className="mt-1 text-lg font-black uppercase tracking-tight text-slate-100">
-              {selectedDevice ? selectedDevice.name : 'Select Device'}
-            </h2>
-          </div>
-          {selectedDevice && (
-            <button
-              onClick={closeCast}
-              className="inline-flex h-9 w-9 items-center justify-center border border-[#2D3139] text-slate-400 transition-colors hover:border-slate-500 hover:text-white"
-              title="Close Cast Panel"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          )}
-        </div>
-
-        <div className="flex flex-1 flex-col gap-4 p-5">
-          {!selectedDevice && (
-            <div className="flex flex-1 flex-col items-center justify-center border border-dashed border-[#2D3139] bg-[#11141A] px-6 text-center">
-              <Radio className="mb-4 h-10 w-10 text-slate-600" />
-              <p className="text-sm font-semibold uppercase tracking-wide text-slate-300">No cast selected</p>
-              <p className="mt-2 text-xs leading-5 text-slate-500">
-                Choose a headset from the list to open its live view in this operator panel.
-              </p>
-            </div>
-          )}
-
-          {selectedDevice && castQuery.isLoading && (
-            <div className="flex flex-1 flex-col items-center justify-center border border-[#2D3139] bg-[#11141A] px-6 text-center">
-              <RefreshCw className="mb-4 h-8 w-8 animate-spin text-blue-400" />
-              <p className="text-sm font-semibold uppercase tracking-wide text-slate-200">Connecting to Local Hub</p>
-              <p className="mt-2 text-xs leading-5 text-slate-500">
-                We are preparing the embedded cast for the operator panel.
-              </p>
-            </div>
-          )}
-
-          {selectedDevice && castQuery.isError && (
-            <div className="flex flex-1 flex-col justify-center border border-red-500/30 bg-red-500/5 px-6 text-center">
-              <TriangleAlert className="mx-auto mb-4 h-9 w-9 text-red-400" />
-              <p className="text-sm font-semibold uppercase tracking-wide text-red-200">Cast unavailable</p>
-              <p className="mt-2 text-xs leading-5 text-red-100/80">
-                {castQuery.error instanceof Error ? castQuery.error.message : 'Open the Local Hub and reconnect the device.'}
-              </p>
-            </div>
-          )}
-
-          {selectedDevice && castQuery.data && (
-            <>
-              <div className="overflow-hidden border border-[#2D3139] bg-black">
-                {streamState === "error" && (
-                  <div className="flex aspect-[4/3] items-center justify-center bg-[#05070A] px-6 text-center">
-                    <div>
-                      <RefreshCw className="mx-auto mb-3 h-7 w-7 text-blue-400" />
-                      <p className="text-xs font-bold uppercase tracking-[0.25em] text-slate-300">
-                        Stream failed
-                      </p>
-                      <p className="mt-2 text-xs leading-5 text-slate-500">
-                        {streamError || 'Local Hub could not capture the Quest screen. Check ADB and retry.'}
-                      </p>
-                    </div>
-                  </div>
-                )}
-
-                <img
-                  src={castQuery.data.stream_url}
-                  alt={`Live cast for ${selectedDevice.name}`}
-                  className={`aspect-[4/3] w-full object-cover ${streamState === "error" ? "hidden" : "block"}`}
-                  onLoad={() => {
-                    setStreamState("ready");
-                    setStreamError(null);
-                  }}
-                  onError={() => {
-                    setStreamState("error");
-                    setStreamError("Local Hub did not return a live stream. Verify that the headset is online and ADB is available.");
-                  }}
-                />
-              </div>
-
-              <div className="grid gap-3 text-xs text-slate-300">
-                <div className="flex items-center justify-between border border-[#2D3139] bg-[#11141A] px-4 py-3">
-                  <span className="uppercase tracking-[0.25em] text-slate-500">Device</span>
-                  <span className="font-mono">{castQuery.data.device.serial_number}</span>
-                </div>
-                <div className="flex items-center justify-between border border-[#2D3139] bg-[#11141A] px-4 py-3">
-                  <span className="uppercase tracking-[0.25em] text-slate-500">Local Hub</span>
-                  <span className="font-mono">{castQuery.data.hub.host}:{castQuery.data.hub.port}</span>
-                </div>
-                <div className="border border-[#2D3139] bg-[#11141A] px-4 py-3 leading-5 text-slate-400">
-                  This cast stays inside the operator panel and is served by Local Hub, so the cloud still never connects directly to the Quest.
-                </div>
-              </div>
-            </>
-          )}
-        </div>
-      </aside>
     </div>
   );
 }

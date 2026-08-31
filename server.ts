@@ -12,13 +12,13 @@ import {
   cancelDeviceCommand,
   dismissHelpRequest,
   finishActiveSessionForDevice,
-  getDefaultPermissionActor,
   getLatestAppVersionForPackage,
   getPermissionActor,
   listAuditLogs,
   listClubs,
   listCommands,
   listDevices,
+  listDevicesForHub,
   listLocalHubs,
   listRooms,
   listSessions,
@@ -30,8 +30,10 @@ import {
   switchSessionApp,
   syncHubState,
   updateCommandStatus,
+  provisionAgentCredential,
 } from "./src/backend/database";
 import { buildCastResponse as buildCastResponsePayload } from "./src/backend/cast";
+import { constantTimeEqualSecret, verifyWebAuthToken } from "./src/backend/auth";
 
 const app = express();
 const PORT = 3000;
@@ -39,12 +41,17 @@ const SHOULD_SEED_MOCK_DEVICE = process.env.SEED_MOCK_DEVICE === "1";
 const LOCAL_HUB_STREAM_PORT = Number(process.env.HUB_PORT ?? "3001");
 const QUEST_AGENT_PACKAGE = process.env.QUEST_AGENT_PACKAGE || "com.bizonvr.spatialspike";
 const HUB_TOKEN = process.env.HUB_TOKEN || "";
+const PRODUCTION_AUTH_SECRET_MINIMUM_LENGTH = 32;
+
+type RequestWithAuth = Request & { actor?: ReturnType<typeof getPermissionActor> };
 
 function expectedHubToken(hubId: number) {
   if (process.env.HUB_TOKENS_JSON) {
     try {
       const tokens = JSON.parse(process.env.HUB_TOKENS_JSON) as Record<string, string>;
-      return tokens[String(hubId)] || null;
+      const token = tokens[String(hubId)];
+      if (token !== undefined && typeof token !== "string") throw new Error("Hub token must be a string");
+      return token || null;
     } catch {
       throw new HttpError(503, "Invalid HUB_TOKENS_JSON configuration");
     }
@@ -53,7 +60,7 @@ function expectedHubToken(hubId: number) {
 }
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: process.env.API_JSON_LIMIT || "64kb", strict: true }));
 
 const db = createDatabase(process.env.DATABASE_PATH ?? ":memory:");
 seedDemoData(db, { seedMockDevice: SHOULD_SEED_MOCK_DEVICE });
@@ -67,10 +74,11 @@ const sessionExpiryTimer = setInterval(() => {
 sessionExpiryTimer.unref?.();
 
 function getRequestActor(req: Request) {
-  const headerUserId = req.header("x-user-id");
-  const actor = headerUserId
-    ? getPermissionActor(db, Number(headerUserId))
-    : (process.env.NODE_ENV === "production" ? null : getDefaultPermissionActor(db));
+  const authenticatedActor = (req as RequestWithAuth).actor;
+  if (authenticatedActor) return authenticatedActor;
+  const allowDevFallback = process.env.NODE_ENV !== "production" && process.env.ALLOW_DEV_AUTH_FALLBACK === "1";
+  const headerUserId = allowDevFallback ? req.header("x-user-id") : null;
+  const actor = headerUserId ? getPermissionActor(db, Number(headerUserId)) : null;
   if (!actor) {
     throw new HttpError(401, "Authentication required", "Sign in as an active club user before performing this action.");
   }
@@ -109,16 +117,68 @@ function assertHubRequest(req: Request, hubId: number) {
   if (process.env.HUB_TOKENS_JSON && !expectedToken) {
     throw new HttpError(401, "No credentials are configured for this Local Hub");
   }
-  if (!expectedToken && process.env.NODE_ENV === "production") {
-    throw new HttpError(503, "Local Hub authentication is not configured", "Set HUB_TOKEN on Cloud API and Local Hub before enabling production command sync.");
+  const allowDevHubFallback = process.env.NODE_ENV !== "production" && process.env.ALLOW_DEV_HUB_AUTH_FALLBACK === "1";
+  if (!expectedToken && !allowDevHubFallback) {
+    throw new HttpError(503, "Local Hub authentication is not configured", "Set a per-hub token before enabling Local Hub command sync.");
   }
-  if (expectedToken && authorization !== `Bearer ${expectedToken}`) {
+  const presentedToken = /^Bearer (.+)$/.exec(authorization.trim())?.[1] || "";
+  if (expectedToken && !constantTimeEqualSecret(presentedToken, expectedToken)) {
     throw new HttpError(401, "Invalid Local Hub credentials", "Reconnect this Local Hub with the configured Hub token.");
   }
   if (!Number.isInteger(hubId) || hubId <= 0) {
     throw new HttpError(400, "Invalid Local Hub id");
   }
 }
+
+function authenticateApiRequest(req: Request) {
+  if (
+    process.env.NODE_ENV === "production" &&
+    (!process.env.AUTH_SECRET || process.env.AUTH_SECRET.length < PRODUCTION_AUTH_SECRET_MINIMUM_LENGTH)
+  ) {
+    throw new HttpError(
+      503,
+      "Web API authentication is not configured",
+      "Set AUTH_SECRET to a random value of at least 32 characters before enabling production",
+    );
+  }
+
+  const verified = verifyWebAuthToken(req.header("authorization"), process.env.AUTH_SECRET);
+  if (verified) {
+    const actor = getPermissionActor(db, verified.userId);
+    if (!actor) throw new HttpError(401, "Authentication required", "The account is inactive or no longer has club membership.");
+    (req as RequestWithAuth).actor = actor;
+    return;
+  }
+
+  const allowDevFallback = process.env.NODE_ENV !== "production" && process.env.ALLOW_DEV_AUTH_FALLBACK === "1";
+  if (allowDevFallback) {
+    const fallbackActor = getPermissionActor(db, Number(req.header("x-user-id")));
+    if (fallbackActor) {
+      (req as RequestWithAuth).actor = fallbackActor;
+      return;
+    }
+  }
+  throw new HttpError(401, "Authentication required", "Send a valid signed Bearer token for an active club user.");
+}
+
+app.use("/api", (req, res, next) => {
+  const isHubTransport = req.path === "/hub/call_operator" || /^\/hubs\/\d+\/sync$/.test(req.path) || /^\/commands\/\d+\/status$/.test(req.path);
+  if (req.path === "/health" || req.path === "/agent/heartbeat" || req.path === "/agent/call_operator" || isHubTransport) return next();
+  if (req.path === "/devices" && req.header("x-hub-id")) {
+    try {
+      assertHubRequest(req, Number(req.header("x-hub-id")));
+      return next();
+    } catch (error) {
+      return handleApiError(res, error);
+    }
+  }
+  try {
+    authenticateApiRequest(req);
+    return next();
+  } catch (error) {
+    return handleApiError(res, error);
+  }
+});
 
 function handleApiError(res: Response, error: unknown) {
   const result = statusFromError(error);
@@ -129,12 +189,12 @@ app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", database: "sqlite-dev", command_transport: "device_commands_via_local_hub" });
 });
 
-app.get("/api/clubs", (_req, res) => {
-  res.json(listClubs(db));
+app.get("/api/clubs", (req, res) => {
+  res.json(listClubs(db, getRequestActor(req)));
 });
 
-app.get("/api/branches", (_req, res) => {
-  const clubs = listClubs(db).map((club: any) => ({
+app.get("/api/branches", (req, res) => {
+  const clubs = listClubs(db, getRequestActor(req)).map((club: any) => ({
     id: club.id,
     club_id: club.id,
     name: club.name,
@@ -145,21 +205,22 @@ app.get("/api/branches", (_req, res) => {
   res.json(clubs);
 });
 
-app.get("/api/rooms", (_req, res) => {
-  res.json(listRooms(db));
+app.get("/api/rooms", (req, res) => {
+  res.json(listRooms(db, getRequestActor(req)));
 });
 
-app.get("/api/hubs", (_req, res) => {
-  res.json(listLocalHubs(db));
+app.get("/api/hubs", (req, res) => {
+  res.json(listLocalHubs(db, getRequestActor(req)));
 });
 
-app.get("/api/devices", (_req, res) => {
-  res.json(listDevices(db));
+app.get("/api/devices", (req, res) => {
+  if (req.header("x-hub-id")) return res.json(listDevicesForHub(db, Number(req.header("x-hub-id"))));
+  res.json(listDevices(db, getRequestActor(req)));
 });
 
-function getCastResult(deviceId: number, options?: { transport?: string | null; profile?: string | null }) {
-  const device = listDevices(db).find((item: any) => item.id === deviceId) as Record<string, unknown> | undefined;
-  const hub = listLocalHubs(db).find((item: any) => item.id === Number(device?.local_hub_id)) as
+function getCastResult(deviceId: number, actor: ReturnType<typeof getPermissionActor>, options?: { transport?: string | null; profile?: string | null }) {
+  const device = listDevices(db, actor).find((item: any) => item.id === deviceId) as Record<string, unknown> | undefined;
+  const hub = listLocalHubs(db, actor).find((item: any) => item.id === Number(device?.local_hub_id)) as
     | { id: number; name: string; status: string; host: string | null }
     | undefined;
   return buildCastResponsePayload(device as any, hub, LOCAL_HUB_STREAM_PORT, options);
@@ -214,7 +275,7 @@ function buildHealthCheck(device: any) {
 }
 
 app.get("/api/devices/:id/cast", (req, res) => {
-  const result = getCastResult(Number(req.params.id), {
+  const result = getCastResult(Number(req.params.id), getRequestActor(req), {
     transport: typeof req.query.transport === "string" ? req.query.transport : null,
     profile: typeof req.query.profile === "string" ? req.query.profile : null,
   });
@@ -222,7 +283,7 @@ app.get("/api/devices/:id/cast", (req, res) => {
 });
 
 app.get("/api/devices/:id/apps", (req, res) => {
-  const device = listDevices(db).find((item: any) => item.id === Number(req.params.id));
+  const device = listDevices(db, getRequestActor(req)).find((item: any) => item.id === Number(req.params.id));
   if (!device) {
     return res.status(404).json({ error: "Device not found" });
   }
@@ -253,7 +314,7 @@ app.post("/api/devices/:id/pair", (req, res) => {
   const deviceId = Number(req.params.id);
   const roomId = Number(req.body.room_id);
   const requestedName = typeof req.body.name === "string" ? req.body.name.trim() : "";
-  const device = listDevices(db).find((item: any) => item.id === deviceId);
+  const device = listDevices(db, getRequestActor(req)).find((item: any) => item.id === deviceId);
   if (!device) {
     return res.status(404).json({ error: "Device not found" });
   }
@@ -278,6 +339,7 @@ app.post("/api/devices/:id/pair", (req, res) => {
     `).run(requestedName || null, deviceId);
 
     const appVersion = getLatestAppVersionForPackage(db, QUEST_AGENT_PACKAGE);
+    const agentToken = provisionAgentCredential(db, deviceId);
     const commandIds: number[] = [];
     if (appVersion?.apk_checksum) {
       commandIds.push(createDeviceCommand(db, {
@@ -289,10 +351,13 @@ app.post("/api/devices/:id/pair", (req, res) => {
           target: "quest_agent",
           package_name: QUEST_AGENT_PACKAGE,
           app_version_id: appVersion.id,
+          artifact_id: `quest-agent-${appVersion.id}`,
           version_name: appVersion.version_name,
           version_code: appVersion.version_code,
           apk_checksum: appVersion.apk_checksum,
           download_url: appVersion.download_url,
+          pairing_id: device.pairing_id || null,
+          agent_token: agentToken,
         },
       }));
     }
@@ -306,6 +371,7 @@ app.post("/api/devices/:id/pair", (req, res) => {
         repair_wireless: true,
         stable_serial: device.stable_id || device.serial_number,
         usb_serial: device.serial_number,
+        pairing_id: device.pairing_id || null,
       },
     }));
 
@@ -317,7 +383,7 @@ app.post("/api/devices/:id/pair", (req, res) => {
 
 app.post("/api/devices/:id/repair", (req, res) => {
   const deviceId = Number(req.params.id);
-  const device = listDevices(db).find((item: any) => item.id === deviceId);
+  const device = listDevices(db, getRequestActor(req)).find((item: any) => item.id === deviceId);
   if (!device) {
     return res.status(404).json({ error: "Device not found" });
   }
@@ -346,7 +412,7 @@ app.post("/api/devices/:id/repair", (req, res) => {
 
 app.post("/api/devices/:id/health-check", (req, res) => {
   const deviceId = Number(req.params.id);
-  const device = listDevices(db).find((item: any) => item.id === deviceId);
+  const device = listDevices(db, getRequestActor(req)).find((item: any) => item.id === deviceId);
   if (!device) {
     return res.status(404).json({ error: "Device not found" });
   }
@@ -356,7 +422,7 @@ app.post("/api/devices/:id/health-check", (req, res) => {
 
 app.delete("/api/devices/:id", (req, res) => {
   const deviceId = Number(req.params.id);
-  const device = listDevices(db).find((item: any) => item.id === deviceId);
+  const device = listDevices(db, getRequestActor(req)).find((item: any) => item.id === deviceId);
   if (!device) {
     return res.status(404).json({ error: "Device not found" });
   }
@@ -366,7 +432,7 @@ app.delete("/api/devices/:id", (req, res) => {
       next_step: "Reconnect the Local Hub before removing this Quest from remembered devices.",
     });
   }
-  const hub = listLocalHubs(db).find((item: any) => item.id === Number(device.local_hub_id)) as { status?: string } | undefined;
+  const hub = listLocalHubs(db, getRequestActor(req)).find((item: any) => item.id === Number(device.local_hub_id)) as { status?: string } | undefined;
   if (!hub || hub.status !== "online") {
     return res.status(409).json({
       error: "Local Hub is offline",
@@ -399,7 +465,7 @@ app.delete("/api/devices/:id", (req, res) => {
 });
 
 app.post("/api/devices/:id/scrcpy", (req, res) => {
-  const result = getCastResult(Number(req.params.id));
+  const result = getCastResult(Number(req.params.id), getRequestActor(req));
   return res.status(result.status).json({
     ...result.body,
     legacy_endpoint: true,
@@ -411,7 +477,7 @@ app.post("/api/devices/:id/scrcpy", (req, res) => {
 
 app.post("/api/devices/:id/install_agent", (req, res) => {
   const deviceId = Number(req.params.id);
-  const device = listDevices(db).find((item: any) => item.id === deviceId);
+  const device = listDevices(db, getRequestActor(req)).find((item: any) => item.id === deviceId);
   if (!device) {
     return res.status(404).json({ error: "Device not found" });
   }
@@ -428,6 +494,7 @@ app.post("/api/devices/:id/install_agent", (req, res) => {
   }
 
   try {
+    const agentToken = provisionAgentCredential(db, deviceId);
     const commandId = createDeviceCommand(db, {
       localHubId: Number(device.local_hub_id),
       deviceId,
@@ -437,10 +504,13 @@ app.post("/api/devices/:id/install_agent", (req, res) => {
         target: "quest_agent",
         package_name: QUEST_AGENT_PACKAGE,
         app_version_id: appVersion.id,
+        artifact_id: `quest-agent-${appVersion.id}`,
         version_name: appVersion.version_name,
         version_code: appVersion.version_code,
         apk_checksum: appVersion.apk_checksum,
         download_url: appVersion.download_url,
+        pairing_id: device.pairing_id || null,
+        agent_token: agentToken,
       },
     });
 
@@ -452,7 +522,7 @@ app.post("/api/devices/:id/install_agent", (req, res) => {
 
 app.post("/api/devices/:id/wake", (req, res) => {
   const deviceId = Number(req.params.id);
-  const device = listDevices(db).find((item: any) => item.id === deviceId);
+  const device = listDevices(db, getRequestActor(req)).find((item: any) => item.id === deviceId);
   if (!device) {
     return res.status(404).json({ error: "Device not found" });
   }
@@ -481,8 +551,8 @@ app.post("/api/devices/:id/wake", (req, res) => {
   }
 });
 
-app.get("/api/commands", (_req, res) => {
-  res.json(listCommands(db));
+app.get("/api/commands", (req, res) => {
+  res.json(listCommands(db, getRequestActor(req)));
 });
 
 app.post("/api/commands", (req, res) => {
@@ -505,8 +575,8 @@ app.post("/api/commands", (req, res) => {
   }
 });
 
-app.get("/api/sessions", (_req, res) => {
-  res.json(listSessions(db));
+app.get("/api/sessions", (req, res) => {
+  res.json(listSessions(db, getRequestActor(req)));
 });
 
 app.post("/api/sessions/start", (req, res) => {
@@ -591,6 +661,7 @@ app.post("/api/sessions/:id/switch-app", (req, res) => {
       appPackage: String(app_package),
       appActivity: app_activity ? String(app_activity) : undefined,
       actor: getRequestActor(req),
+      idempotencyKey: req.header("idempotency-key"),
     });
     return res.json({ success: true, session: summary });
   } catch (error) {
@@ -599,12 +670,17 @@ app.post("/api/sessions/:id/switch-app", (req, res) => {
 });
 
 app.post("/api/hub/call_operator", (req, res) => {
-  const { pairing_id } = req.body;
-  if (!pairing_id) {
-    return res.status(400).json({ error: "Missing pairing_id" });
+  const { pairing_id, hub_id } = req.body;
+  if (!pairing_id || !hub_id) {
+    return res.status(400).json({ error: "Missing pairing_id or hub_id" });
   }
-
-  markOperatorCall(db, String(pairing_id));
+  try {
+    const hubId = Number(hub_id);
+    assertHubRequest(req, hubId);
+    markOperatorCall(db, String(pairing_id), hubId);
+  } catch (error) {
+    return handleApiError(res, error);
+  }
   return res.json({ success: true });
 });
 
@@ -618,7 +694,7 @@ app.post("/api/devices/:id/dismiss_help", (req, res) => {
 });
 
 app.post("/api/agent/heartbeat", (_req, res) => {
-  res.json({ success: true });
+  res.status(401).json({ error: "Agent heartbeat must be sent to the authenticated Local Hub" });
 });
 
 app.post("/api/hubs/:id/sync", (req, res) => {
@@ -641,10 +717,14 @@ app.post("/api/commands/:id/status", (req, res) => {
   }
 
   try {
+    const requestedHubId = Number(req.body.hub_id);
+    if (!Number.isInteger(requestedHubId) || requestedHubId <= 0) {
+      return res.status(400).json({ error: "hub_id is required" });
+    }
+    assertHubRequest(req, requestedHubId);
     const command = db.prepare(`SELECT local_hub_id FROM device_commands WHERE id = ?`).get(commandId) as { local_hub_id: number } | undefined;
     if (!command) return res.status(404).json({ error: "Command not found" });
-    assertHubRequest(req, Number(req.body.hub_id ?? command.local_hub_id));
-    if (Number(req.body.hub_id ?? command.local_hub_id) !== command.local_hub_id) {
+    if (requestedHubId !== command.local_hub_id) {
       return res.status(403).json({ error: "Command belongs to another Local Hub" });
     }
     const result = req.body.result && typeof req.body.result === "object" ? req.body.result : undefined;
@@ -673,8 +753,18 @@ app.post("/api/commands/:id/cancel", (req, res) => {
   }
 });
 
-app.get("/api/audit-logs", (_req, res) => {
-  res.json(listAuditLogs(db));
+app.get("/api/audit-logs", (req, res) => {
+  res.json(listAuditLogs(db, getRequestActor(req)));
+});
+
+app.use((error: any, _req: Request, res: Response, next: Function) => {
+  if (error?.type === "entity.too.large" || error?.status === 413) {
+    return res.status(413).json({ error: "Request body is too large", next_step: "Send only the bounded JSON control payload; APK files use the Local Hub artifact cache." });
+  }
+  if (error instanceof SyntaxError && "body" in error) {
+    return res.status(400).json({ error: "Malformed JSON body" });
+  }
+  return next(error);
 });
 
 async function startServer() {
@@ -697,4 +787,8 @@ async function startServer() {
   });
 }
 
-startServer();
+export { app, db };
+
+if (process.env.NODE_ENV !== "test") {
+  startServer();
+}

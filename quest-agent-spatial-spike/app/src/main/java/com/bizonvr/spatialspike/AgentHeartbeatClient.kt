@@ -9,6 +9,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
 data class HeartbeatSnapshot(
+    val agentToken: String,
     val pairingId: String,
     val agentId: String,
     val androidId: String,
@@ -90,14 +91,16 @@ class AgentHeartbeatClient {
         postJson(
             url = "http://${snapshot.hubIp}:${snapshot.hubPort}/api/agent/heartbeat",
             body = body,
-            onResult = onResult
+            onResult = onResult,
+            authorizationToken = snapshot.agentToken
         )
     }
 
-    fun callOperator(pairingId: String, hubIp: String, hubPort: Int) {
+    fun callOperator(pairingId: String, agentToken: String, hubIp: String, hubPort: Int) {
         postJson(
             url = "http://$hubIp:$hubPort/api/agent/call_operator",
-            body = """{"pairing_id":"$pairingId"}"""
+            body = """{"pairing_id":"$pairingId","timestamp":${System.currentTimeMillis()}}""",
+            authorizationToken = agentToken
         )
     }
 
@@ -105,13 +108,16 @@ class AgentHeartbeatClient {
         executor.shutdownNow()
     }
 
-    private fun postJson(url: String, body: String, onResult: (Boolean) -> Unit = {}) {
+    private fun postJson(url: String, body: String, onResult: (Boolean) -> Unit = {}, authorizationToken: String? = null) {
         executor.execute {
             runCatching {
-                Log.i(TAG, "POST $url body=$body")
+                Log.i(TAG, "POST $url")
                 val connection = URL(url).openConnection() as HttpURLConnection
                 connection.requestMethod = "POST"
                 connection.setRequestProperty("Content-Type", "application/json")
+                authorizationToken?.takeIf { it.isNotBlank() }?.let {
+                    connection.setRequestProperty("Authorization", "Bearer $it")
+                }
                 connection.connectTimeout = 3000
                 connection.readTimeout = 3000
                 connection.doOutput = true

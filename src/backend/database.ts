@@ -231,6 +231,16 @@ function parseJsonArray(value: string | null | undefined) {
   }
 }
 
+function redactSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => {
+    return /(token|secret|password|credential|private[_-]?key)/i.test(key)
+      ? [key, "[REDACTED]"]
+      : [key, redactSecrets(item)];
+  }));
+}
+
 function dedupeIps(...groups: Array<Array<string | null | undefined> | undefined>) {
   const ordered: string[] = [];
   for (const group of groups) {
@@ -453,6 +463,7 @@ type DeviceIdentity = {
 };
 
 const QUEST_AGENT_PACKAGE = process.env.QUEST_AGENT_PACKAGE || "com.bizonvr.spatialspike";
+const AGENT_HEARTBEAT_MAX_AGE_MS = Number(process.env.AGENT_HEARTBEAT_MAX_AGE_MS || 60_000);
 
 const COMMAND_TYPES = new Set([
   "PING", "REFRESH_STATUS", "INSTALL_APP", "INSTALL_APK", "UNINSTALL_APP", "LAUNCH_APP", "STOP_APP",
@@ -507,12 +518,12 @@ export function getCommandPolicy(type: string) {
   return COMMAND_POLICIES[type] ?? { maxAttempts: 1, retryable: false, reconciliable: false, dangerous: true };
 }
 
-function readMigration(relativePath: string) {
-  return fs.readFileSync(path.join(process.cwd(), relativePath), "utf8");
+function readMigration(relativePath: string, migrationsDir = path.join(process.cwd(), "db", "migrations")) {
+  return fs.readFileSync(path.join(migrationsDir, relativePath), "utf8");
 }
 
-function listMigrationFiles() {
-  return fs.readdirSync(path.join(process.cwd(), "db", "migrations"))
+function listMigrationFiles(migrationsDir = path.join(process.cwd(), "db", "migrations")) {
+  return fs.readdirSync(migrationsDir)
     .filter((file) => file.endsWith(".sql"))
     .sort();
 }
@@ -565,7 +576,7 @@ function ensureSchemaCompatibility(db: SqliteDatabase, migrationFile?: string) {
   // normal migration will add command reliability fields once commands exist.
 }
 
-function applyMigrations(db: SqliteDatabase) {
+export function applyMigrations(db: SqliteDatabase, migrationsDir = path.join(process.cwd(), "db", "migrations")) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version TEXT PRIMARY KEY,
@@ -590,22 +601,32 @@ function applyMigrations(db: SqliteDatabase) {
     appliedVersions.add("0001_initial.sql");
   }
 
-  for (const migrationFile of listMigrationFiles()) {
+  for (const migrationFile of listMigrationFiles(migrationsDir)) {
     if (appliedVersions.has(migrationFile)) {
       continue;
     }
 
-    try {
-      db.exec(readMigration(path.join("db", "migrations", migrationFile)));
-    } catch (error) {
-      if (!["0002_device_route_columns.sql", "0004_session_lifecycle.sql", "0005_device_command_reliability.sql", "0006_session_reliability.sql"].includes(migrationFile)) {
-        throw error;
-      }
+    const applyMigration = db.transaction(() => {
+      // 0001 in the current tree already contains these columns, while 0002
+      // is still needed by databases created from the older 0001 snapshot.
+      // Skip only that known-compatible shape; keep the version record inside
+      // the same transaction as every other migration.
+      const routeColumns = new Set(
+        (db.prepare(`PRAGMA table_info(devices)`).all() as Array<{ name: string }>).map((column) => column.name),
+      );
+      const alreadyCompatible = migrationFile === "0002_device_route_columns.sql"
+        && routeColumns.has("active_route")
+        && routeColumns.has("last_adb_seen_at");
+      const hasTable = (table: string) => Boolean(db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table));
+      const isPartialLegacySnapshot =
+        (migrationFile === "0004_session_lifecycle.sql" && !hasTable("session_devices"))
+        || (migrationFile === "0005_device_command_reliability.sql" && !hasTable("device_commands"))
+        || (migrationFile === "0006_session_reliability.sql" && (!hasTable("sessions") || !hasTable("session_devices")));
+      if (!alreadyCompatible && !isPartialLegacySnapshot) db.exec(readMigration(migrationFile, migrationsDir));
       ensureSchemaCompatibility(db, migrationFile);
-    }
-
-    ensureSchemaCompatibility(db, migrationFile);
-    db.prepare(`INSERT INTO schema_migrations (version) VALUES (?)`).run(migrationFile);
+      db.prepare(`INSERT INTO schema_migrations (version) VALUES (?)`).run(migrationFile);
+    });
+    applyMigration();
   }
 
   // 0005 adds the durable command fields. Backfill hashes in application code
@@ -660,8 +681,47 @@ export function writeAuditLog(
     params.action,
     params.entityType,
     String(params.entityId),
-    JSON.stringify(params.details ?? {}),
+    JSON.stringify(redactSecrets(params.details ?? {})),
   );
+}
+
+export function provisionAgentCredential(db: SqliteDatabase, deviceId: number) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  const hash = crypto.createHash("sha256").update(token).digest("hex");
+  const updated = db.prepare(`
+    UPDATE devices
+    SET agent_token_hash = ?, agent_token_issued_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(hash, deviceId);
+  if (updated.changes !== 1) throw new Error("Device not found");
+  return token;
+}
+
+export function verifyAgentCredential(
+  db: SqliteDatabase,
+  identity: { pairingId?: string | null; agentId?: string | null; stableId?: string | null; androidId?: string | null },
+  token: string,
+) {
+  if (!token || typeof token !== "string") return null;
+  const candidates = [identity.pairingId, identity.agentId, identity.stableId, identity.androidId].filter(Boolean) as string[];
+  if (candidates.length === 0) return null;
+  const placeholders = candidates.map(() => "?").join(",");
+  const device = db.prepare(`
+    SELECT id, club_id, local_hub_id, pairing_id, agent_id, stable_id, android_id, agent_token_hash
+    FROM devices
+    WHERE pairing_id IN (${placeholders}) OR agent_id IN (${placeholders}) OR stable_id IN (${placeholders}) OR android_id IN (${placeholders})
+    LIMIT 1
+  `).get(...candidates, ...candidates, ...candidates, ...candidates) as
+    | { id: number; club_id: number; local_hub_id: number | null; pairing_id: string | null; agent_id: string | null; stable_id: string | null; android_id: string | null; agent_token_hash: string | null }
+    | undefined;
+  if (!device?.agent_token_hash) return null;
+  const actualHash = crypto.createHash("sha256").update(token).digest("hex");
+  const left = Buffer.from(actualHash);
+  const right = Buffer.from(device.agent_token_hash);
+  if (left.length !== right.length || !crypto.timingSafeEqual(left, right)) return null;
+  const knownIdentities = new Set([device.pairing_id, device.agent_id, device.stable_id, device.android_id].filter(Boolean).map(String));
+  const matchesIdentity = candidates.every((candidate) => knownIdentities.has(String(candidate)));
+  return matchesIdentity ? device : null;
 }
 
 export function createOrganization(db: SqliteDatabase, input: CreateOrganizationInput) {
@@ -698,9 +758,10 @@ export function createUser(
 
 export function getPermissionActor(db: SqliteDatabase, userId: number): PermissionActor | null {
   const user = db.prepare(`
-    SELECT id, organization_id, role, status
-    FROM users
-    WHERE id = ?
+    SELECT u.id, u.organization_id, u.role, u.status
+    FROM users u
+    JOIN organizations o ON o.id = u.organization_id
+    WHERE u.id = ? AND o.status = 'active'
   `).get(userId) as
     | { id: number; organization_id: number; role: PermissionActor["role"]; status: string }
     | undefined;
@@ -2101,7 +2162,8 @@ export function switchSessionApp(
   return getActiveSessionForDevice(db, active.device_id);
 }
 
-export function listRooms(db: SqliteDatabase) {
+export function listRooms(db: SqliteDatabase, actor?: PermissionActor | null) {
+  const scope = actor ? `WHERE c.organization_id = ? AND r.club_id IN (${actor.clubIds?.map(() => "?").join(",") || "-1"})` : "";
   return db.prepare(`
     SELECT
       r.*,
@@ -2110,16 +2172,21 @@ export function listRooms(db: SqliteDatabase) {
     FROM club_rooms r
     LEFT JOIN club_zones z ON z.id = r.zone_id
     JOIN clubs c ON c.id = r.club_id
+    ${scope}
     ORDER BY c.id, r.sort_order, r.id
-  `).all();
+  `).all(...(actor ? [actor.organizationId, ...(actor.clubIds?.length ? actor.clubIds : [-1])] : []));
 }
 
-export function listClubs(db: SqliteDatabase) {
-  return db.prepare(`SELECT * FROM clubs ORDER BY id`).all();
+export function listClubs(db: SqliteDatabase, actor?: PermissionActor | null) {
+  if (!actor) return db.prepare(`SELECT * FROM clubs ORDER BY id`).all();
+  return db.prepare(`SELECT * FROM clubs WHERE organization_id = ? AND id IN (${actor.clubIds?.map(() => "?").join(",") || "-1"}) ORDER BY id`)
+    .all(actor.organizationId, ...(actor.clubIds?.length ? actor.clubIds : [-1]));
 }
 
-export function listLocalHubs(db: SqliteDatabase) {
-  return db.prepare(`SELECT * FROM local_hubs ORDER BY id`).all();
+export function listLocalHubs(db: SqliteDatabase, actor?: PermissionActor | null) {
+  if (!actor) return db.prepare(`SELECT * FROM local_hubs ORDER BY id`).all();
+  return db.prepare(`SELECT h.* FROM local_hubs h JOIN clubs c ON c.id = h.club_id WHERE c.organization_id = ? AND h.club_id IN (${actor.clubIds?.map(() => "?").join(",") || "-1"}) ORDER BY h.id`)
+    .all(actor.organizationId, ...(actor.clubIds?.length ? actor.clubIds : [-1]));
 }
 
 function getInstalledAppsForDevice(db: SqliteDatabase, deviceId: number) {
@@ -2137,7 +2204,8 @@ function getInstalledAppsForDevice(db: SqliteDatabase, deviceId: number) {
   `).all(deviceId);
 }
 
-export function listDevices(db: SqliteDatabase) {
+export function listDevices(db: SqliteDatabase, actor?: PermissionActor | null) {
+  const scope = actor ? `WHERE c.organization_id = ? AND d.club_id IN (${actor.clubIds?.map(() => "?").join(",") || "-1"})` : "";
   const devices = db.prepare(`
     SELECT
       d.*,
@@ -2147,10 +2215,12 @@ export function listDevices(db: SqliteDatabase) {
       r.name AS room_name,
       h.name AS local_hub_name
     FROM devices d
+    JOIN clubs c ON c.id = d.club_id
     LEFT JOIN club_rooms r ON r.id = d.room_id
     LEFT JOIN local_hubs h ON h.id = d.local_hub_id
+    ${scope}
     ORDER BY d.id
-  `).all() as Array<Record<string, unknown>>;
+  `).all(...(actor ? [actor.organizationId, ...(actor.clubIds?.length ? actor.clubIds : [-1])] : [])) as Array<Record<string, unknown>>;
 
   for (const device of devices) {
     const apps = getInstalledAppsForDevice(db, Number(device.id));
@@ -2160,6 +2230,8 @@ export function listDevices(db: SqliteDatabase) {
     device.active_session = activeSession;
     device.remaining_seconds = activeSession?.remaining_seconds ?? 0;
     device.previous_ips = parseJsonArray(String(device.previous_ips ?? "[]"));
+    delete device.agent_token_hash;
+    delete device.agent_token_issued_at;
     device.device_status = device.status;
     Object.assign(device, getLatestDeviceConnectivity(db, Number(device.id)));
     device.connection_status = computeConnectionStatus(
@@ -2182,6 +2254,16 @@ export function listDevices(db: SqliteDatabase) {
   }
 
   return devices;
+}
+
+export function listDevicesForHub(db: SqliteDatabase, localHubId: number) {
+  const hub = db.prepare(`
+    SELECT h.club_id, c.organization_id
+    FROM local_hubs h JOIN clubs c ON c.id = h.club_id
+    WHERE h.id = ?
+  `).get(localHubId) as { club_id: number; organization_id: number } | undefined;
+  if (!hub) return [];
+  return listDevices(db, { userId: 0, organizationId: hub.organization_id, role: "technician", clubIds: [hub.club_id] });
 }
 
 function getLatestDeviceConnectivity(db: SqliteDatabase, deviceId: number) {
@@ -2266,10 +2348,13 @@ function getCurrentSessionSeconds(db: SqliteDatabase, deviceId: number) {
   return row.session_seconds ?? 0;
 }
 
-export function listCommands(db: SqliteDatabase) {
-  const rows = db.prepare(`SELECT * FROM device_commands ORDER BY created_at DESC, id DESC`).all() as Array<Record<string, unknown>>;
+export function listCommands(db: SqliteDatabase, actor?: PermissionActor | null) {
+  const scope = actor ? `WHERE c.organization_id = ? AND dc.club_id IN (${actor.clubIds?.map(() => "?").join(",") || "-1"})` : "";
+  const rows = db.prepare(`SELECT dc.* FROM device_commands dc JOIN clubs c ON c.id = dc.club_id ${scope} ORDER BY dc.created_at DESC, dc.id DESC`)
+    .all(...(actor ? [actor.organizationId, ...(actor.clubIds?.length ? actor.clubIds : [-1])] : [])) as Array<Record<string, unknown>>;
   return rows.map((row) => ({
     ...row,
+    payload: JSON.stringify(redactSecrets(parseJsonObject(String(row.payload ?? "{}")))),
     operator_state: row.status === "timeout" && row.outcome_state === "unknown"
       ? "result_unknown"
       : row.status === "created" || row.status === "sent_to_hub"
@@ -2284,8 +2369,10 @@ export function listCommands(db: SqliteDatabase) {
   }));
 }
 
-export function listSessions(db: SqliteDatabase) {
-  return db.prepare(`SELECT * FROM sessions ORDER BY created_at DESC, id DESC`).all();
+export function listSessions(db: SqliteDatabase, actor?: PermissionActor | null) {
+  if (!actor) return db.prepare(`SELECT * FROM sessions ORDER BY created_at DESC, id DESC`).all();
+  return db.prepare(`SELECT * FROM sessions WHERE organization_id = ? AND club_id IN (${actor.clubIds?.map(() => "?").join(",") || "-1"}) ORDER BY created_at DESC, id DESC`)
+    .all(actor.organizationId, ...(actor.clubIds?.length ? actor.clubIds : [-1]));
 }
 
 /**
@@ -2350,8 +2437,10 @@ export function reconcileExpiredSessions(db: SqliteDatabase, now = new Date()) {
   return createdCommandIds;
 }
 
-export function listAuditLogs(db: SqliteDatabase) {
-  return db.prepare(`SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT 50`).all();
+export function listAuditLogs(db: SqliteDatabase, actor?: PermissionActor | null) {
+  if (!actor) return db.prepare(`SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT 50`).all();
+  return db.prepare(`SELECT * FROM audit_logs WHERE organization_id = ? AND (club_id IS NULL OR club_id IN (${actor.clubIds?.map(() => "?").join(",") || "-1"})) ORDER BY created_at DESC, id DESC LIMIT 50`)
+    .all(actor.organizationId, ...(actor.clubIds?.length ? actor.clubIds : [-1]));
 }
 
 export function assignDeviceToRoom(db: SqliteDatabase, deviceId: number, roomId: number, actor?: PermissionActor | null) {
@@ -2393,12 +2482,12 @@ export function dismissHelpRequest(db: SqliteDatabase, deviceId: number, actor?:
   `).run(deviceId);
 }
 
-export function markOperatorCall(db: SqliteDatabase, pairingId: string) {
-  db.prepare(`
+export function markOperatorCall(db: SqliteDatabase, pairingId: string, localHubId?: number) {
+  return db.prepare(`
     UPDATE devices
     SET needs_operator_help = 1, updated_at = CURRENT_TIMESTAMP
-    WHERE pairing_id = ?
-  `).run(pairingId);
+    WHERE pairing_id = ? ${localHubId ? "AND local_hub_id = ?" : ""}
+  `).run(...(localHubId ? [pairingId, localHubId] : [pairingId]));
 }
 
 export function updateCommandStatus(
@@ -2906,6 +2995,12 @@ function reconcileSessionFromHeartbeat(db: SqliteDatabase, deviceId: number, hea
   return heartbeat.in_session === true && active.session_status !== "finishing" && packageMatches;
 }
 
+function isFreshAgentHeartbeat(heartbeat: NonNullable<SyncPayload["agent_heartbeats"]>[number], now = Date.now()) {
+  if (heartbeat.timestamp === undefined || heartbeat.timestamp === null) return true;
+  const timestamp = Number(heartbeat.timestamp);
+  return Number.isFinite(timestamp) && Math.abs(now - timestamp) <= AGENT_HEARTBEAT_MAX_AGE_MS;
+}
+
 export function syncHubState(db: SqliteDatabase, hubId: number, payload: SyncPayload) {
   const hub = db.prepare(`
     SELECT h.id, h.club_id, c.organization_id
@@ -3076,6 +3171,7 @@ export function syncHubState(db: SqliteDatabase, hubId: number, payload: SyncPay
     }
 
     for (const heartbeat of payload.agent_heartbeats ?? []) {
+      if (!isFreshAgentHeartbeat(heartbeat)) continue;
       const device = findDeviceByIdentity(db, {
         serialNumber: heartbeat.stable_id ?? null,
         stableId: heartbeat.stable_id ?? null,

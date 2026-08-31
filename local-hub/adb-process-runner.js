@@ -30,6 +30,11 @@ function killProcess(child, signal) {
   }
 }
 
+function normalizeByteLimit(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
 export function createAdbProcessRunner({
   executable = process.env.ADB_PATH || 'adb',
   prefixArgs = [],
@@ -61,6 +66,11 @@ export function createAdbProcessRunner({
       const binaryOutput = options.encoding === 'buffer';
       let stdout = binaryOutput ? Buffer.alloc(0) : '';
       let stderr = '';
+      const maxStdoutBytes = normalizeByteLimit(options.maxStdoutBytes ?? (binaryOutput ? 8 * 1024 * 1024 : 1024 * 1024), binaryOutput ? 8 * 1024 * 1024 : 1024 * 1024);
+      const maxStderrBytes = normalizeByteLimit(options.maxStderrBytes ?? 256 * 1024, 256 * 1024);
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let outputLimitExceeded = false;
       let onAbort = () => {};
 
       const finish = (result) => {
@@ -71,7 +81,7 @@ export function createAdbProcessRunner({
         options.signal?.removeEventListener?.('abort', onAbort);
         if (child) active.delete(child);
         resolve({
-          ok: !result.spawnError && !result.timedOut && result.code === 0,
+          ok: !result.spawnError && !result.timedOut && !outputLimitExceeded && result.code === 0,
           command,
           args: argv,
           stdout,
@@ -81,6 +91,8 @@ export function createAdbProcessRunner({
           timedOut: Boolean(result.timedOut),
           cancelled,
           spawnError: result.spawnError || null,
+          outputLimitExceeded,
+          errorCode: outputLimitExceeded ? 'OUTPUT_LIMIT_EXCEEDED' : null,
           durationMs: Math.max(0, now() - startedAt),
         });
       };
@@ -88,6 +100,15 @@ export function createAdbProcessRunner({
       onAbort = () => {
         if (settled) return;
         cancelled = true;
+        killProcess(child, 'SIGTERM');
+        killTimer = setTimeout(() => {
+          if (!settled) killProcess(child, 'SIGKILL');
+        }, killGraceMs);
+      };
+
+      const stopForOutputLimit = () => {
+        if (outputLimitExceeded || settled) return;
+        outputLimitExceeded = true;
         killProcess(child, 'SIGTERM');
         killTimer = setTimeout(() => {
           if (!settled) killProcess(child, 'SIGKILL');
@@ -114,10 +135,18 @@ export function createAdbProcessRunner({
         options.signal?.addEventListener?.('abort', onAbort, { once: true });
       }
 
-      child.stdout?.setEncoding?.('utf8');
+      if (!binaryOutput) child.stdout?.setEncoding?.('utf8');
       child.stderr?.setEncoding?.('utf8');
-      child.stdout?.on('data', (chunk) => { stdout = binaryOutput ? Buffer.concat([stdout, Buffer.from(chunk)]) : stdout + chunk; });
-      child.stderr?.on('data', (chunk) => { stderr += chunk; });
+      child.stdout?.on('data', (chunk) => {
+        stdoutBytes += Buffer.byteLength(chunk);
+        if (stdoutBytes > maxStdoutBytes) return stopForOutputLimit();
+        stdout = binaryOutput ? Buffer.concat([stdout, Buffer.from(chunk)]) : stdout + chunk;
+      });
+      child.stderr?.on('data', (chunk) => {
+        stderrBytes += Buffer.byteLength(chunk);
+        if (stderrBytes > maxStderrBytes) return stopForOutputLimit();
+        stderr += chunk;
+      });
       child.once('error', (error) => finish({ spawnError: error, timedOut }));
       child.once('close', (code, signal) => finish({ code, signal, timedOut }));
 
@@ -140,6 +169,8 @@ export function createAdbProcessRunner({
     if (!result.ok) {
       const reason = result.timedOut
         ? `ADB command timed out after ${options.timeoutMs ?? defaultTimeoutMs}ms.`
+        : result.outputLimitExceeded
+          ? 'ADB process output exceeded the configured safety limit.'
         : result.spawnError
           ? `ADB process could not start: ${result.spawnError.message || result.spawnError}`
           : `ADB exited with code ${result.code ?? 'unknown'}${result.stderr ? `: ${result.stderr.trim()}` : ''}`;

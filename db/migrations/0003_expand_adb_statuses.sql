@@ -18,8 +18,8 @@ CREATE TABLE IF NOT EXISTS devices_v2 (
       'offline',
       'busy',
       'in_session',
-      'maintenance',
-      'warning',
+      'maintenance_required',
+      'charging_required',
       'error',
       'disabled'
     )

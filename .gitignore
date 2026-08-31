@@ -6,6 +6,8 @@ coverage/
 .DS_Store
 *.log
 .playwright-mcp/
+db/dev.sqlite
+quest-agent-spatial-spike/.kotlin/
 .env*
 !.env.example
 

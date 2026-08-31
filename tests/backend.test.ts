@@ -15,6 +15,7 @@ import {
   createSubscriptionPlan,
   createUser,
   createSession,
+  assignDeviceToRoom,
   finishActiveSessionForDevice,
   getActiveSessionForDevice,
   getPermissionActor,
@@ -30,6 +31,11 @@ import {
   dismissHelpRequest,
   updateCommandStatus,
   upsertDeviceApp,
+  provisionAgentCredential,
+  verifyAgentCredential,
+  listClubs,
+  listLocalHubs,
+  listRooms,
 } from "../src/backend/database";
 import fs from "node:fs";
 import os from "node:os";
@@ -1037,5 +1043,50 @@ describe("BizonVR Backend Logic Tests", () => {
     const logs = listAuditLogs(db) as Array<any>;
     assert.ok(logs.some((log) => log.action === "session.created" && log.entity_id === String(sessionId)));
     assert.ok(logs.some((log) => log.action === "device_command.created"));
+  });
+
+  it("binds Agent credentials to one Quest and never exposes the stored credential", () => {
+    const { db, deviceId, actor } = createReadyFixture();
+    const token = provisionAgentCredential(db, deviceId);
+    const device = (listDevices(db, actor) as Array<any>)[0];
+    assert.equal(verifyAgentCredential(db, { pairingId: device.pairing_id, stableId: device.stable_id }, token)?.id, deviceId);
+    assert.equal(verifyAgentCredential(db, { pairingId: device.pairing_id, stableId: device.stable_id }, "wrong-token"), null);
+    assert.equal(verifyAgentCredential(db, { pairingId: device.pairing_id, stableId: "OTHER-QUEST" }, token), null);
+    assert.equal(Object.prototype.hasOwnProperty.call(device, "agent_token_hash"), false);
+  });
+
+  it("filters every operator collection by authenticated organization and club scope", () => {
+    const { db, actor } = createReadyFixture();
+    const otherOrganizationId = createOrganization(db, { name: "Other Org", slug: `other-${Math.random()}` });
+    const otherClubId = createClub(db, { organizationId: otherOrganizationId, name: "Other Club", slug: `other-club-${Math.random()}` });
+    const otherRoomId = createClubRoom(db, { clubId: otherClubId, name: "Other Room", slug: `other-room-${Math.random()}` });
+    const otherHubId = createLocalHub(db, { clubId: otherClubId, name: "Other Hub" });
+    const otherDeviceId = createDevice(db, { clubId: otherClubId, roomId: otherRoomId, localHubId: otherHubId, name: "Other Quest", serialNumber: `OTHER-${Math.random()}` });
+    createDeviceCommand(db, { deviceId: otherDeviceId, localHubId: otherHubId, type: "REFRESH_STATUS" });
+    assert.equal((listClubs(db, actor) as Array<any>).some((row) => row.id === otherClubId), false);
+    assert.equal((listRooms(db, actor) as Array<any>).some((row) => row.id === otherRoomId), false);
+    assert.equal((listLocalHubs(db, actor) as Array<any>).some((row) => row.id === otherHubId), false);
+    assert.equal((listDevices(db, actor) as Array<any>).some((row) => row.id === otherDeviceId), false);
+    assert.equal((listCommands(db, actor) as Array<any>).some((row) => row.device_id === otherDeviceId), false);
+    assert.equal((listAuditLogs(db, actor) as Array<any>).some((row) => row.club_id === otherClubId), false);
+    assert.throws(() => createDeviceCommand(db, { deviceId: otherDeviceId, localHubId: otherHubId, type: "REFRESH_STATUS", actor }), /organization scope mismatch/);
+    assert.throws(() => assignDeviceToRoom(db, otherDeviceId, otherRoomId, actor), /organization scope mismatch/);
+  });
+
+  it("does not refresh Agent state from an old heartbeat", () => {
+    const { db, hubId, deviceId } = createReadyFixture();
+    const device = (listDevices(db) as Array<any>).find((row) => row.id === deviceId) as any;
+    db.prepare(`UPDATE devices SET agent_status = 'offline', last_heartbeat_at = NULL WHERE id = ?`).run(deviceId);
+    syncHubState(db, hubId, {
+      agent_heartbeats: [{
+        stable_id: device.stable_id,
+        pairing_id: device.pairing_id,
+        timestamp: Date.now() - 120_000,
+        in_session: false,
+      }],
+    });
+    const after = (listDevices(db) as Array<any>).find((row) => row.id === deviceId) as any;
+    assert.equal(after.agent_status, "offline");
+    assert.equal(after.last_heartbeat_at, null);
   });
 });

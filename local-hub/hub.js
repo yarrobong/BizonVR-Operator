@@ -23,6 +23,7 @@ import {
     safeWriteHead,
 } from './streaming.js';
 import { DEFAULT_CAST_PROFILE, DEFAULT_CAST_TRANSPORT } from '../src/shared/cast-config.js';
+import { resolveApprovedApk } from './apk-security.js';
 
 function readCastNumber(name, fallback, minimum = 0) {
     const value = Number(process.env[name]);
@@ -39,6 +40,7 @@ const HUB_TOKEN = process.env.HUB_TOKEN || (() => {
 })();
 const QUEST_AGENT_PACKAGE = process.env.QUEST_AGENT_PACKAGE || 'com.bizonvr.spatialspike';
 const QUEST_AGENT_MAIN_ACTIVITY = process.env.QUEST_AGENT_MAIN_ACTIVITY || '.SpatialLauncherActivity';
+const APK_ARTIFACT_ROOT = path.resolve(process.env.APK_CACHE_ROOT || path.join(process.cwd(), '.cache', 'local-hub', 'apks'));
 const QUEST_AGENT_APK_PATH = resolveQuestAgentApkPath();
 const ENABLE_WIRELESS_ADB = process.env.ENABLE_WIRELESS_ADB === '1';
 const SCRCPY_MAX_SIZE = process.env.SCRCPY_MAX_SIZE || '1600';
@@ -62,6 +64,8 @@ const INCLUDED_NON_VR_PACKAGES = new Set([
 const STREAM_FRAME_INTERVAL_MS = Number(process.env.STREAM_FRAME_INTERVAL_MS || 120);
 const DEVICE_SERIAL_REGEX = /^[A-Za-z0-9._:-]+$/;
 const STREAM_BOOT_TIMEOUT_MS = Number(process.env.STREAM_BOOT_TIMEOUT_MS || 7000);
+const AGENT_JSON_BODY_LIMIT = readCastNumber('AGENT_JSON_BODY_LIMIT', 32 * 1024, 1024);
+const AGENT_HEARTBEAT_MAX_AGE_MS = readCastNumber('AGENT_HEARTBEAT_MAX_AGE_MS', 60000, 1000);
 const CAST_MAX_CONCURRENT = readCastNumber('MAX_CONCURRENT_CASTS', 4, 1);
 const CAST_MAX_VIEWERS = readCastNumber('MAX_CAST_VIEWERS', 4, 1);
 const CAST_TERM_GRACE_MS = readCastNumber('CAST_TERM_GRACE_MS', 1000);
@@ -82,6 +86,7 @@ const APK_CACHE_ROOT = path.join(ICON_CACHE_ROOT, 'apks');
 const ICON_PUBLIC_ROOT = path.resolve(process.cwd(), 'public', 'app-icons');
 const ICON_CACHE_INDEX_PATH = path.join(ICON_CACHE_ROOT, 'index.json');
 const WIRELESS_STATE_PATH = path.resolve(process.cwd(), '.cache', 'local-hub', 'wireless-state.json');
+const AGENT_CREDENTIALS_PATH = path.resolve(process.cwd(), '.cache', 'local-hub', 'agent-credentials.json');
 const COMMAND_STATE_PATH = path.resolve(process.cwd(), '.cache', 'local-hub', 'command-state.sqlite');
 const WIRELESS_SETUP_RETRY_MS = Number(process.env.WIRELESS_SETUP_RETRY_MS || 60000);
 const WIRELESS_ADB_PORT = Number(process.env.WIRELESS_ADB_PORT || 5555);
@@ -130,6 +135,7 @@ process.on('unhandledRejection', (reason) => {
 
 // Local Heartbeat Tracking
 let agentHeartbeats = {};
+let agentCredentials = loadAgentCredentials();
 const deviceAppCache = {};
 const iconCacheIndex = loadIconCacheIndex();
 const wirelessStateIndex = loadWirelessStateIndex();
@@ -294,8 +300,7 @@ function resolveQuestAgentApkPath() {
     }
 
     const candidates = [
-        path.resolve(process.cwd(), 'quest-agent.apk'),
-        path.resolve(process.cwd(), 'quest-agent-spatial-spike/app/build/outputs/apk/debug/app-debug.apk'),
+        path.join(APK_ARTIFACT_ROOT, 'quest-agent.apk'),
     ];
 
     for (const candidate of candidates) {
@@ -307,7 +312,6 @@ function resolveQuestAgentApkPath() {
 
     return candidates[0];
 }
-
 function buildAgentComponent() {
     const normalizedActivity = QUEST_AGENT_MAIN_ACTIVITY.startsWith('.')
         ? `${QUEST_AGENT_PACKAGE}/${QUEST_AGENT_MAIN_ACTIVITY}`
@@ -343,6 +347,59 @@ function loadWirelessStateIndex() {
 function saveWirelessStateIndex() {
     ensureDir(path.dirname(WIRELESS_STATE_PATH));
     fs.writeFileSync(WIRELESS_STATE_PATH, JSON.stringify(wirelessStateIndex, null, 2));
+}
+
+function loadAgentCredentials() {
+    try { return JSON.parse(fs.readFileSync(AGENT_CREDENTIALS_PATH, 'utf8')); } catch (e) { return {}; }
+}
+
+function saveAgentCredentials() {
+    ensureDir(path.dirname(AGENT_CREDENTIALS_PATH));
+    fs.writeFileSync(AGENT_CREDENTIALS_PATH, JSON.stringify(agentCredentials, null, 2), { mode: 0o600 });
+    try { fs.chmodSync(AGENT_CREDENTIALS_PATH, 0o600); } catch (e) {}
+}
+
+function hashAgentToken(token) {
+    return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+function rememberAgentCredential(stableSerial, payload) {
+    const token = typeof payload?.agent_token === 'string' ? payload.agent_token : '';
+    if (!token || !stableSerial) return;
+    agentCredentials[stableSerial] = {
+        token,
+        tokenHash: hashAgentToken(token),
+        pairingId: payload.pairing_id || null,
+        agentId: payload.agent_id || null,
+        stableId: stableSerial,
+        lastTimestamp: 0,
+    };
+    saveAgentCredentials();
+}
+
+function verifyAgentRequest(req, data) {
+    const presented = /^Bearer (.+)$/.exec(String(req.headers.authorization || '').trim())?.[1] || '';
+    if (!presented) return { ok: false, status: 401 };
+    const candidates = [data.pairing_id, data.agent_id, data.stable_id, data.android_id].filter(Boolean).map(String);
+    if (candidates.length === 0) return { ok: false, status: 401 };
+    const record = Object.values(agentCredentials).find((entry) => {
+        const knownIdentities = new Set([entry.pairingId, entry.agentId, entry.stableId, entry.androidId].filter(Boolean).map(String));
+        return candidates.every((candidate) => knownIdentities.has(String(candidate)));
+    });
+    if (!record) return { ok: false, status: 401 };
+    const actual = Buffer.from(hashAgentToken(presented));
+    const expected = Buffer.from(String(record.tokenHash || ''));
+    if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return { ok: false, status: 401 };
+    if (data.timestamp === undefined) return { ok: false, status: 408 };
+    {
+        const timestamp = Number(data.timestamp);
+        const now = Date.now();
+        if (!Number.isFinite(timestamp) || Math.abs(now - timestamp) > AGENT_HEARTBEAT_MAX_AGE_MS) return { ok: false, status: 408 };
+        if (Number(record.lastTimestamp || 0) >= timestamp) return { ok: false, status: 409 };
+        record.lastTimestamp = timestamp;
+        saveAgentCredentials();
+    }
+    return { ok: true, record };
 }
 
 function clearIgnoredDevice(stableSerial) {
@@ -393,6 +450,33 @@ function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function readJsonBody(req, maxBytes = 64 * 1024) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let totalBytes = 0;
+        let tooLarge = false;
+        req.on('data', (chunk) => {
+            totalBytes += Buffer.byteLength(chunk);
+            if (totalBytes > maxBytes) {
+                tooLarge = true;
+                chunks.length = 0;
+                return;
+            }
+            if (!tooLarge) chunks.push(Buffer.from(chunk));
+        });
+        req.on('end', () => {
+            if (tooLarge) {
+                const error = new Error('Request body is too large');
+                error.statusCode = 413;
+                return reject(error);
+            }
+            try { return resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); }
+            catch (error) { return reject(Object.assign(new Error('Malformed JSON body'), { statusCode: 400 })); }
+        });
+        req.on('error', reject);
+    });
+}
+
 function pushPreviousIps(state, nextIp) {
     return normalizeIpList([nextIp, ...(state?.previousIps || []), state?.ip]).slice(0, 8);
 }
@@ -400,6 +484,8 @@ function pushPreviousIps(state, nextIp) {
 async function runAdbCapture(args, options = {}) {
     return adbProcessRunner.capture(args, {
         timeoutMs: options.timeoutMs || ADB_COMMAND_TIMEOUT_MS,
+        maxStdoutBytes: options.maxStdoutBytes,
+        maxStderrBytes: options.maxStderrBytes,
         spawnOptions: options.spawnOptions,
     });
 }
@@ -1497,7 +1583,14 @@ async function reconcileCommand(command, executionSerial, stableSerial) {
             ? { success: true, reconciled: true, message: `Reconciled: ${packageName} is already foreground` }
             : { success: false, unknown: true, error: `Expected ${packageName || 'requested app'} is not foreground`, errorCode: 'COMMAND_RECONCILIATION_FAILED' };
     }
-    if (['STOP_APP', 'END_SESSION'].includes(type)) {
+    if (type === 'END_SESSION') {
+        const foreground = await getCurrentForegroundPackage(executionSerial);
+        const heartbeat = findAgentHeartbeatForRoute({ stableSerial });
+        return foreground === QUEST_AGENT_PACKAGE && heartbeat && heartbeat.in_session === false && !heartbeat.session_id
+            ? { success: true, reconciled: true, cleanup_confirmed: true, foreground_package: foreground, agent_confirmed: true, message: 'Reconciled: launcher foreground and Agent confirmed session cleanup' }
+            : { success: false, unknown: true, error: 'Session cleanup could not be confirmed by launcher foreground and Agent signals', errorCode: 'SESSION_CLEANUP_NOT_CONFIRMED' };
+    }
+    if (type === 'STOP_APP') {
         const foreground = await getCurrentForegroundPackage(executionSerial);
         return !foreground || !packageName || foreground !== packageName
             ? { success: true, reconciled: true, message: 'Reconciled: requested app is no longer foreground' }
@@ -1569,14 +1662,16 @@ async function getAdbDevices() {
 function spawnAdb(args, onSuccessMessage) {
     return adbProcessRunner.run(args).then((result) => {
         if (result.ok) return { success: true, message: onSuccessMessage || 'Command executed successfully', stdout: result.stdout };
-        const error = result.timedOut
+        const error = result.outputLimitExceeded
+            ? 'ADB process output exceeded the configured safety limit.'
+            : result.timedOut
             ? `ADB command timed out after ${ADB_COMMAND_TIMEOUT_MS}ms.`
             : result.spawnError?.message || result.stderr || `Process exited with code ${result.code ?? 'unknown'}`;
         logHub('ADB', 'ADB command failed', { args, error, timedOut: result.timedOut, durationMs: result.durationMs });
         return {
             success: false,
             error,
-            errorCode: result.timedOut ? 'ADB_PROCESS_TIMEOUT' : result.spawnError ? 'ADB_PROCESS_SPAWN_FAILED' : 'ADB_COMMAND_FAILED',
+            errorCode: result.outputLimitExceeded ? 'OUTPUT_LIMIT_EXCEEDED' : result.timedOut ? 'ADB_PROCESS_TIMEOUT' : result.spawnError ? 'ADB_PROCESS_SPAWN_FAILED' : 'ADB_COMMAND_FAILED',
             timedOut: result.timedOut,
             transportFailure: isAdbTransportFailure(result),
         };
@@ -1585,11 +1680,12 @@ function spawnAdb(args, onSuccessMessage) {
 
 async function capturePngFrame(deviceSerial) {
     if (!isValidDeviceSerial(deviceSerial)) return { success: false, error: 'Invalid device serial' };
-    const result = await adbProcessRunner.run(['-s', deviceSerial, 'exec-out', 'screencap', '-p'], { encoding: 'buffer' });
+    const result = await adbProcessRunner.run(['-s', deviceSerial, 'exec-out', 'screencap', '-p'], { encoding: 'buffer', maxStdoutBytes: Number(process.env.MAX_SCREENCAP_BYTES || 8 * 1024 * 1024), maxStderrBytes: 256 * 1024 });
     if (result.ok) return { success: true, frame: result.stdout };
     return {
         success: false,
-        error: result.timedOut ? `ADB screencap timed out after ${ADB_COMMAND_TIMEOUT_MS}ms.` : result.stderr || `screencap exited with code ${result.code ?? 'unknown'}`,
+        error: result.outputLimitExceeded ? 'ADB screencap exceeded the binary output safety limit.' : result.timedOut ? `ADB screencap timed out after ${ADB_COMMAND_TIMEOUT_MS}ms.` : result.stderr || `screencap exited with code ${result.code ?? 'unknown'}`,
+        errorCode: result.outputLimitExceeded ? 'OUTPUT_LIMIT_EXCEEDED' : undefined,
         timedOut: result.timedOut,
         transportFailure: isAdbTransportFailure(result),
     };
@@ -2034,6 +2130,9 @@ function buildAgentStartArgs(deviceSerial, options = {}) {
         '--es', 'HUB_IP', connection.host,
         '--ei', 'HUB_PORT', connection.port,
     ];
+    const stableSerial = resolveStableSerial(deviceSerial);
+    const agentToken = options.agentToken || agentCredentials[stableSerial]?.token;
+    if (agentToken) args.push('--es', 'AGENT_TOKEN', String(agentToken));
 
     if (options.action) {
         args.push('--es', 'SESSION_ACTION', options.action);
@@ -2172,11 +2271,15 @@ async function runCommand(deviceSerial, commandType, payloadStr, commandMeta = {
 
 function runCommandOnce(deviceSerial, commandType, payloadStr, commandMeta = {}) {
   return new Promise(async (resolve) => {
-     logHub('Command', `Executing ${commandType} on ${deviceSerial}`, payloadStr || '{}');
+     let logPayload = {};
+     try { logPayload = JSON.parse(payloadStr || '{}'); } catch (e) {}
+     const safeLogPayload = Object.fromEntries(Object.entries(logPayload).map(([key, value]) => [/token|secret|credential/i.test(key) ? [key, '[REDACTED]'] : [key, value]]));
+     logHub('Command', `Executing ${commandType} on ${deviceSerial}`, safeLogPayload);
      
      let payload = {};
      try { payload = typeof payloadStr === 'string' ? JSON.parse(payloadStr || '{}') : (payloadStr || {}); } catch(e) {}
      const { stableSerial, selectedRoute } = await resolveRouteForCommand(deviceSerial, commandType, payload);
+     rememberAgentCredential(stableSerial, payload);
      const adbRoute = selectedRoute;
 
      if (!['RECONNECT_ADB', 'FORGET_DEVICE', 'RUN_DIAGNOSTICS'].includes(commandType) && !adbRoute) {
@@ -2381,36 +2484,41 @@ function runCommandOnce(deviceSerial, commandType, payloadStr, commandMeta = {})
                 action: 'STOP',
                 sessionState: payload.session_state || null,
                 autoLaunch: false,
-            }), "Session ended, launcher started").then(resolve);
+            }), "Session ended, launcher started").then(async (result) => {
+                if (!result.success) return resolve(result);
+                const deadline = Date.now() + Number(process.env.SESSION_CLEANUP_CONFIRM_TIMEOUT_MS || 5000);
+                while (Date.now() < deadline) {
+                    const foreground = await getCurrentForegroundPackage(adbRoute);
+                    const heartbeat = findAgentHeartbeatForRoute({ stableSerial });
+                    if (foreground === QUEST_AGENT_PACKAGE && heartbeat && heartbeat.in_session === false && !heartbeat.session_id) {
+                        return resolve({ ...result, cleanup_confirmed: true, foreground_package: foreground, agent_confirmed: true });
+                    }
+                    await delay(200);
+                }
+                resolve({ success: false, error: 'Session cleanup could not be confirmed by foreground and Agent signals', errorCode: 'SESSION_CLEANUP_NOT_CONFIRMED', operator_required: true });
+            });
         }, 1000);
 
      } else if (commandType === 'INSTALL_APP') {
-        const apkPath = payload.apkPath;
-        if (!apkPath) return resolve({ success: false, error: "Missing apkPath" });
-        logHub('ADB', `Installing APK ${apkPath} on ${adbRoute}`);
-        spawnAdb(['-s', adbRoute, 'install', '-r', apkPath], "APK Installed")
+        const artifact = resolveApprovedApk(payload, { root: APK_ARTIFACT_ROOT, sha256File });
+        if (artifact.error) return resolve({ success: false, error: artifact.error, errorCode: artifact.errorCode || 'APK_VALIDATION_FAILED' });
+        logHub('ADB', `Installing approved APK artifact on ${adbRoute}`);
+        spawnAdb(['-s', adbRoute, 'install', '-r', artifact.path], "APK Installed")
             .then(resolve);
 
      } else if (commandType === 'INSTALL_APK') {
         const agentPkg = payload.package_name || QUEST_AGENT_PACKAGE;
         if (!isValidPackage(agentPkg)) return resolve({ success: false, error: "Invalid package name" });
         if (!payload.apk_checksum) return resolve({ success: false, error: "Missing APK checksum in command payload" });
-        if (!fs.existsSync(QUEST_AGENT_APK_PATH)) {
-            return resolve({ success: false, error: `APK artifact not found at ${QUEST_AGENT_APK_PATH}` });
-        }
-        const actualChecksum = sha256File(QUEST_AGENT_APK_PATH);
-        if (actualChecksum !== payload.apk_checksum) {
-            return resolve({
-                success: false,
-                error: `APK checksum mismatch for ${agentPkg}: expected ${payload.apk_checksum}, got ${actualChecksum}`,
-            });
-        }
+        const artifact = resolveApprovedApk({ ...payload, artifact_id: payload.artifact_id || path.basename(QUEST_AGENT_APK_PATH) }, { root: APK_ARTIFACT_ROOT, sha256File });
+        if (artifact.error) return resolve({ success: false, error: artifact.error, errorCode: artifact.errorCode || 'APK_VALIDATION_FAILED' });
+        rememberAgentCredential(stableSerial, payload);
         logHub('Agent', `Installing Quest Agent on ${adbRoute}`);
-        spawnAdb(['-s', adbRoute, 'install', '-r', QUEST_AGENT_APK_PATH], `Installed Agent`)
+        spawnAdb(['-s', adbRoute, 'install', '-r', artifact.path], `Installed Agent`)
             .then((res) => {
                 if(res.success) {
                     logHub('Agent', `Starting Quest Agent on ${adbRoute}`);
-                    spawnAdb(buildAgentStartArgs(adbRoute), `Started Agent installed`)
+                    spawnAdb(buildAgentStartArgs(adbRoute, { agentToken: payload.agent_token }), `Started Agent installed`)
                        .then(resolve);
                 } else {
                     resolve(res);
@@ -2553,6 +2661,10 @@ function bootstrapKnownDevices() {
         const req = protocol.request(`${API_URL}/api/devices`, {
             method: 'GET',
             timeout: BOOTSTRAP_TIMEOUT_MS,
+            headers: {
+                ...(HUB_TOKEN ? { Authorization: `Bearer ${HUB_TOKEN}` } : {}),
+                'x-hub-id': String(HUB_ID),
+            },
         }, (res) => {
             let data = '';
             res.on('data', (chunk) => data += chunk);
@@ -2855,7 +2967,7 @@ async function syncWithCloud() {
 const localServer = http.createServer((req, res) => {
     // CORS headers for local network just in case
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
     if (req.method === 'OPTIONS') {
         res.writeHead(200);
@@ -2883,11 +2995,13 @@ const localServer = http.createServer((req, res) => {
     }
 
     if (req.method === 'POST' && req.url === '/api/agent/heartbeat') {
-        let body = '';
-        req.on('data', chunk => body += chunk.toString());
-        req.on('end', () => {
+        readJsonBody(req, AGENT_JSON_BODY_LIMIT).then((data) => {
             try {
-                const data = JSON.parse(body);
+                const auth = verifyAgentRequest(req, data);
+                if (!auth.ok) {
+                    res.writeHead(auth.status, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: auth.status === 408 ? 'STALE_HEARTBEAT' : auth.status === 409 ? 'REPLAYED_HEARTBEAT' : 'Invalid Agent credentials' }));
+                }
                 const ip = req.socket.remoteAddress;
                 const id = buildHeartbeatIdentity(data);
                 if (isIgnoredDevice(data.stable_id || null, data.agent_id || data.pairing_id || null)) {
@@ -2924,16 +3038,21 @@ const localServer = http.createServer((req, res) => {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: true }));
             } catch(e) {
-                res.writeHead(400);
+                if (!res.headersSent) res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Bad Request' }));
             }
+        }).catch((error) => {
+            res.writeHead(error.statusCode || 400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: error.statusCode === 413 ? 'Request body is too large' : 'Malformed JSON body' }));
         });
     } else if (req.method === 'POST' && req.url === '/api/agent/call_operator') {
-        let body = '';
-        req.on('data', chunk => body += chunk.toString());
-        req.on('end', () => {
+        readJsonBody(req, AGENT_JSON_BODY_LIMIT).then((data) => {
             try {
-                const data = JSON.parse(body);
+                const auth = verifyAgentRequest(req, data);
+                if (!auth.ok) {
+                    res.writeHead(auth.status, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: 'Invalid Agent credentials' }));
+                }
                 const ip = req.socket.remoteAddress;
                 const id = buildHeartbeatIdentity(data) || 'unknown-agent';
                 logHub('Agent', `Agent ${id} called operator`, { ip });
@@ -2951,15 +3070,18 @@ const localServer = http.createServer((req, res) => {
                 }
                 const cloudReq = protocol.request(`${API_URL}/api/hub/call_operator`, reqOption, (cloudRes) => {});
                 cloudReq.on('error', (err) => console.error('[Local Hub] Error forwarding call_operator:', err.message));
-                cloudReq.write(JSON.stringify({ pairing_id: data.pairing_id }));
+                cloudReq.write(JSON.stringify({ pairing_id: data.pairing_id, hub_id: HUB_ID }));
                 cloudReq.end();
                 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: true }));
             } catch(e) {
-                res.writeHead(400);
+                if (!res.headersSent) res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Bad Request' }));
             }
+        }).catch((error) => {
+            res.writeHead(error.statusCode || 400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: error.statusCode === 413 ? 'Request body is too large' : 'Malformed JSON body' }));
         });
     } else {
         res.writeHead(404);

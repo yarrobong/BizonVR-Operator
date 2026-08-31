@@ -9,6 +9,8 @@ export type AdbProcessResult = {
   timedOut: boolean;
   cancelled: boolean;
   spawnError: unknown;
+  outputLimitExceeded: boolean;
+  errorCode: string | null;
   durationMs: number;
 };
 
@@ -18,8 +20,8 @@ export function createAdbProcessRunner(options?: {
   defaultTimeoutMs?: number;
   killGraceMs?: number;
 }): {
-  run(args: Array<string | number>, options?: { timeoutMs?: number; encoding?: "buffer"; signal?: AbortSignal; spawnOptions?: Record<string, unknown> }): Promise<AdbProcessResult>;
-  capture(args: Array<string | number>, options?: { timeoutMs?: number; signal?: AbortSignal; spawnOptions?: Record<string, unknown> }): Promise<string | Buffer>;
+  run(args: Array<string | number>, options?: { timeoutMs?: number; maxStdoutBytes?: number; maxStderrBytes?: number; encoding?: "buffer"; signal?: AbortSignal; spawnOptions?: Record<string, unknown> }): Promise<AdbProcessResult>;
+  capture(args: Array<string | number>, options?: { timeoutMs?: number; maxStdoutBytes?: number; maxStderrBytes?: number; encoding?: "buffer"; signal?: AbortSignal; spawnOptions?: Record<string, unknown> }): Promise<string | Buffer>;
   getActiveCount(): number;
 };
 

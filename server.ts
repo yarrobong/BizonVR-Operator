@@ -8,6 +8,8 @@ import {
   createDatabase,
   createDeviceCommand,
   createSession,
+  extendSession,
+  cancelDeviceCommand,
   dismissHelpRequest,
   finishActiveSessionForDevice,
   getDefaultPermissionActor,
@@ -23,6 +25,7 @@ import {
   markOperatorCall,
   pauseSession,
   resumeSession,
+  reconcileExpiredSessions,
   seedDemoData,
   switchSessionApp,
   syncHubState,
@@ -35,12 +38,33 @@ const PORT = 3000;
 const SHOULD_SEED_MOCK_DEVICE = process.env.SEED_MOCK_DEVICE === "1";
 const LOCAL_HUB_STREAM_PORT = Number(process.env.HUB_PORT ?? "3001");
 const QUEST_AGENT_PACKAGE = process.env.QUEST_AGENT_PACKAGE || "com.bizonvr.spatialspike";
+const HUB_TOKEN = process.env.HUB_TOKEN || "";
+
+function expectedHubToken(hubId: number) {
+  if (process.env.HUB_TOKENS_JSON) {
+    try {
+      const tokens = JSON.parse(process.env.HUB_TOKENS_JSON) as Record<string, string>;
+      return tokens[String(hubId)] || null;
+    } catch {
+      throw new HttpError(503, "Invalid HUB_TOKENS_JSON configuration");
+    }
+  }
+  return HUB_TOKEN || null;
+}
 
 app.use(cors());
 app.use(express.json());
 
 const db = createDatabase(process.env.DATABASE_PATH ?? ":memory:");
 seedDemoData(db, { seedMockDevice: SHOULD_SEED_MOCK_DEVICE });
+const sessionExpiryTimer = setInterval(() => {
+  try {
+    reconcileExpiredSessions(db);
+  } catch (error) {
+    console.error("[SessionEngine] expiry reconciliation failed", error);
+  }
+}, 5000);
+sessionExpiryTimer.unref?.();
 
 function getRequestActor(req: Request) {
   const headerUserId = req.header("x-user-id");
@@ -77,6 +101,23 @@ function statusFromError(error: unknown) {
     return { status: 409, body: { error: message, state: "command_failed", next_step: "Refresh device status and retry once Local Hub reports a healthy state." } };
   }
   return { status: 400, body: { error: message } };
+}
+
+function assertHubRequest(req: Request, hubId: number) {
+  const authorization = req.header("authorization") || "";
+  const expectedToken = expectedHubToken(hubId);
+  if (process.env.HUB_TOKENS_JSON && !expectedToken) {
+    throw new HttpError(401, "No credentials are configured for this Local Hub");
+  }
+  if (!expectedToken && process.env.NODE_ENV === "production") {
+    throw new HttpError(503, "Local Hub authentication is not configured", "Set HUB_TOKEN on Cloud API and Local Hub before enabling production command sync.");
+  }
+  if (expectedToken && authorization !== `Bearer ${expectedToken}`) {
+    throw new HttpError(401, "Invalid Local Hub credentials", "Reconnect this Local Hub with the configured Hub token.");
+  }
+  if (!Number.isInteger(hubId) || hubId <= 0) {
+    throw new HttpError(400, "Invalid Local Hub id");
+  }
 }
 
 function handleApiError(res: Response, error: unknown) {
@@ -501,7 +542,7 @@ app.post("/api/sessions/start", (req, res) => {
 app.post("/api/sessions/:device_id/stop", (req, res) => {
   try {
     const deviceId = Number(req.params.device_id);
-    const sessionId = finishActiveSessionForDevice(db, deviceId, getRequestActor(req));
+    const sessionId = finishActiveSessionForDevice(db, deviceId, getRequestActor(req), { idempotencyKey: req.header("idempotency-key") });
     return res.json({ success: Boolean(sessionId), session_id: sessionId });
   } catch (error) {
     return handleApiError(res, error);
@@ -510,7 +551,7 @@ app.post("/api/sessions/:device_id/stop", (req, res) => {
 
 app.post("/api/sessions/:id/pause", (req, res) => {
   try {
-    const summary = pauseSession(db, Number(req.params.id), getRequestActor(req));
+    const summary = pauseSession(db, Number(req.params.id), getRequestActor(req), { idempotencyKey: req.header("idempotency-key") });
     return res.json({ success: true, session: summary });
   } catch (error) {
     return handleApiError(res, error);
@@ -519,7 +560,20 @@ app.post("/api/sessions/:id/pause", (req, res) => {
 
 app.post("/api/sessions/:id/resume", (req, res) => {
   try {
-    const summary = resumeSession(db, Number(req.params.id), getRequestActor(req));
+    const summary = resumeSession(db, Number(req.params.id), getRequestActor(req), { idempotencyKey: req.header("idempotency-key") });
+    return res.json({ success: true, session: summary });
+  } catch (error) {
+    return handleApiError(res, error);
+  }
+});
+
+app.post("/api/sessions/:id/extend", (req, res) => {
+  const minutes = Number(req.body?.minutes ?? req.body?.extension_minutes);
+  if (!Number.isInteger(minutes) || minutes <= 0) {
+    return res.status(400).json({ error: "minutes must be a positive whole number" });
+  }
+  try {
+    const summary = extendSession(db, Number(req.params.id), minutes, getRequestActor(req), { idempotencyKey: req.header("idempotency-key") });
     return res.json({ success: true, session: summary });
   } catch (error) {
     return handleApiError(res, error);
@@ -569,10 +623,13 @@ app.post("/api/agent/heartbeat", (_req, res) => {
 
 app.post("/api/hubs/:id/sync", (req, res) => {
   try {
-    const commands = syncHubState(db, Number(req.params.id), req.body ?? {});
+    const hubId = Number(req.params.id);
+    assertHubRequest(req, hubId);
+    const commands = syncHubState(db, hubId, req.body ?? {});
     return res.json({ commands });
   } catch (error) {
-    return res.status(400).json({ error: error instanceof Error ? error.message : "Hub sync failed" });
+    const resolved = statusFromError(error);
+    return res.status(resolved.status).json(resolved.body);
   }
 });
 
@@ -584,8 +641,33 @@ app.post("/api/commands/:id/status", (req, res) => {
   }
 
   try {
-    updateCommandStatus(db, commandId, String(status), error_message ? String(error_message) : null);
-    return res.json({ success: true });
+    const command = db.prepare(`SELECT local_hub_id FROM device_commands WHERE id = ?`).get(commandId) as { local_hub_id: number } | undefined;
+    if (!command) return res.status(404).json({ error: "Command not found" });
+    assertHubRequest(req, Number(req.body.hub_id ?? command.local_hub_id));
+    if (Number(req.body.hub_id ?? command.local_hub_id) !== command.local_hub_id) {
+      return res.status(403).json({ error: "Command belongs to another Local Hub" });
+    }
+    const result = req.body.result && typeof req.body.result === "object" ? req.body.result : undefined;
+    const updated = updateCommandStatus(db, commandId, String(status), error_message ? String(error_message) : null, {
+      hubId: command.local_hub_id,
+      hubInstanceId: req.body.hub_instance_id ? String(req.body.hub_instance_id) : null,
+      claimToken: req.body.claim_token ? String(req.body.claim_token) : null,
+      errorCode: req.body.error_code ? String(req.body.error_code) : null,
+      outcomeState: req.body.outcome_state,
+      result,
+      route: req.body.route ? String(req.body.route) : null,
+      reconciled: Boolean(req.body.reconciled),
+      resultDeliveryAttempt: req.body.result_delivery_attempt ? Number(req.body.result_delivery_attempt) : null,
+    });
+    return res.json({ success: true, idempotent: Boolean((updated as any)?.idempotent) });
+  } catch (error) {
+    return handleApiError(res, error);
+  }
+});
+
+app.post("/api/commands/:id/cancel", (req, res) => {
+  try {
+    return res.json(cancelDeviceCommand(db, Number(req.params.id), getRequestActor(req)));
   } catch (error) {
     return handleApiError(res, error);
   }

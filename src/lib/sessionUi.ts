@@ -1,6 +1,6 @@
 export type SessionCardState = {
   session_id: number;
-  status: 'running' | 'paused' | 'ended';
+  status: 'starting' | 'running' | 'paused' | 'finishing' | 'ended';
   remaining_seconds: number;
   current_app_name?: string | null;
   current_app_package?: string;
@@ -21,6 +21,28 @@ export function getSessionUiState(session?: SessionCardState | null) {
     return {
       headline: null,
       subline: 'No active user session',
+      canPause: false,
+      canResume: false,
+      canStop: false,
+      canSwitch: false,
+    };
+  }
+
+  if (session.status === 'starting') {
+    return {
+      headline: null,
+      subline: 'Starting game…',
+      canPause: false,
+      canResume: false,
+      canStop: true,
+      canSwitch: false,
+    };
+  }
+
+  if (session.status === 'finishing') {
+    return {
+      headline: null,
+      subline: 'Ending session…',
       canPause: false,
       canResume: false,
       canStop: false,

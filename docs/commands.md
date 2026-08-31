@@ -120,6 +120,22 @@ Local Hub may use this typed refresh payload to:
 }
 ```
 
+### EXTEND_SESSION
+
+`EXTEND_SESSION` is a sync-only Agent command. The authoritative duration is
+already committed in Cloud; the command delivers the new timestamp-derived
+state to the Quest and is safe to reconcile. Older databases use a
+`RESUME_SESSION` payload with `resync_only: true` during migration compatibility.
+
+```json
+{
+  "session_id": 42,
+  "package": "com.example.game",
+  "extension_minutes": 10,
+  "session_state": { "revision": 3, "remaining_seconds": 1800 }
+}
+```
+
 ## Local Hub Safety
 
 Local Hub must map every command type to an explicit handler. For example:

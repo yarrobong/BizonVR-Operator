@@ -32,6 +32,7 @@ CREATE TABLE device_commands_new (
       'START_SESSION',
       'PAUSE_SESSION',
       'RESUME_SESSION',
+      'EXTEND_SESSION',
       'SWITCH_SESSION_APP',
       'END_SESSION',
       'OPEN_LAUNCHER',

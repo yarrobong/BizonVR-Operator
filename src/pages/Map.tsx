@@ -194,6 +194,13 @@ function noticeFromError(error: unknown, fallback: string): ActionNotice {
   return { state: "command_failed", message: fallback };
 }
 
+function createIdempotencyKey(action: string, id: number) {
+  const suffix = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `operator-${action}-${id}-${suffix}`;
+}
+
 function getNoticeTone(state: ApiState) {
   if (state === "subscription_blocked") return "border-amber-400/40 bg-amber-500/10 text-amber-100";
   if (state === "permission_denied") return "border-red-400/40 bg-red-500/10 text-red-100";
@@ -316,6 +323,27 @@ export function Map() {
     },
     onError: (error) => {
       setActionNotice(noticeFromError(error, "Session resume failed"));
+    }
+  });
+
+  const extendCurrentSession = useMutation({
+    mutationFn: async ({ sessionId, minutes, idempotencyKey }: { sessionId: number; minutes: number; idempotencyKey: string }) => {
+      const res = await fetch(`/api/sessions/${sessionId}/extend`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
+        },
+        body: JSON.stringify({ minutes }),
+      });
+      return readApiResponse(res);
+    },
+    onSuccess: () => {
+      setActionNotice(null);
+      queryClient.invalidateQueries({ queryKey: ['devices'] });
+    },
+    onError: (error) => {
+      setActionNotice(noticeFromError(error, "Session extension failed"));
     }
   });
 
@@ -762,7 +790,7 @@ export function Map() {
                      <div className="mt-2 text-[11px] uppercase tracking-[0.2em] text-slate-500">
                        {selectedSession.current_app_name || selectedSession.current_app_package}
                      </div>
-                     <div className="mt-4 grid grid-cols-3 gap-2">
+                     <div className="mt-4 grid grid-cols-2 gap-2">
                        {selectedSessionUi.canPause && (
                          <button
                            onClick={() => pauseCurrentSession.mutate(selectedSession.session_id)}
@@ -786,6 +814,24 @@ export function Map() {
                          >
                            Stop
                          </button>
+                       )}
+                       {(selectedSession.status === 'running' || selectedSession.status === 'paused') && (
+                         <>
+                           {[10, 30].map((minutes) => (
+                             <button
+                               key={minutes}
+                               onClick={() => extendCurrentSession.mutate({
+                                 sessionId: selectedSession.session_id,
+                                 minutes,
+                                 idempotencyKey: createIdempotencyKey('extend', selectedSession.session_id),
+                               })}
+                               disabled={extendCurrentSession.isPending}
+                               className="border border-blue-500/30 bg-blue-500/10 py-2 text-[10px] font-bold uppercase text-blue-200 hover:bg-blue-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                             >
+                               +{minutes} min
+                             </button>
+                           ))}
+                         </>
                        )}
                      </div>
                    </div>

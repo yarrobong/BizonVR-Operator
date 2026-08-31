@@ -39,7 +39,7 @@ type CastInfo = {
   };
 };
 
-type StreamStatus = "idle" | "connecting" | "playing" | "error";
+type StreamStatus = "idle" | "connecting" | "playing" | "reconnecting" | "error";
 
 const CODEC_CANDIDATES = [
   'video/mp4; codecs="avc1.64001F"',
@@ -98,6 +98,13 @@ function useFmp4Player(url: string | null, enabled: boolean, reloadToken: number
     let sourceOpen = false;
     let disposed = false;
     let markedPlaying = false;
+    let lastByteAt = Date.now();
+    const stallTimer = window.setInterval(() => {
+      if (!disposed && markedPlaying && Date.now() - lastByteAt > 2500) {
+        setStatus("reconnecting");
+        setError("Quest доступен, но поток временно прерван. Local Hub восстанавливает ADB и перезапустит трансляцию автоматически.");
+      }
+    }, 500);
 
     const syncLiveEdge = () => {
       if (!video.buffered.length) return;
@@ -163,6 +170,7 @@ function useFmp4Player(url: string | null, enabled: boolean, reloadToken: number
             continue;
           }
 
+          lastByteAt = Date.now();
           queue.push(value);
           flushQueue();
           if (!markedPlaying) {
@@ -177,7 +185,7 @@ function useFmp4Player(url: string | null, enabled: boolean, reloadToken: number
           return;
         }
         setStatus("error");
-        setError(streamError instanceof Error ? streamError.message : "Live video stream failed");
+        setError(streamError instanceof Error ? streamError.message : "Трансляция завершилась. Нажмите Reconnect или откройте MJPEG Preview.");
       }
     };
 
@@ -189,6 +197,7 @@ function useFmp4Player(url: string | null, enabled: boolean, reloadToken: number
 
     return () => {
       disposed = true;
+      window.clearInterval(stallTimer);
       abortController.abort();
       if (sourceOpen && mediaSource.readyState === "open" && !ended) {
         try {
@@ -317,7 +326,7 @@ export function Cast() {
                 <video ref={videoRef} className="h-full w-full bg-black object-contain" controls={false} autoPlay muted playsInline />
                 {status !== "playing" && (
                   <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-sm text-slate-300">
-                    {status === "error" ? error || "Live video failed" : "Buffering fMP4 stream..."}
+                    {status === "error" ? error || "Live video failed" : status === "reconnecting" ? error || "Reconnecting to Local Hub..." : "Buffering fMP4 stream..."}
                   </div>
                 )}
               </div>
@@ -359,7 +368,7 @@ export function Cast() {
                     {castQuery.data?.device.name || `Quest #${deviceId}`}
                   </p>
                   <p className="text-xs text-slate-400">
-                    {status === "playing" ? "Live video flowing" : status === "connecting" ? "Connecting to Local Hub" : status === "error" ? "Stream error" : "Idle"}
+                    {status === "playing" ? "Live video flowing" : status === "reconnecting" ? "Reconnecting ADB / stream" : status === "connecting" ? "Connecting to Local Hub" : status === "error" ? "Stream error" : "Idle"}
                   </p>
                 </div>
               </div>

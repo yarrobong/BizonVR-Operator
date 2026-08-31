@@ -9,6 +9,8 @@ export function createAdbSupervisor(options?: {
   debounceMs?: number;
   baseBackoffMs?: number;
   maxBackoffMs?: number;
+  jitterRatio?: number;
+  random?: () => number;
   now?: () => number;
   log?: (scope: string, message: string, extra?: unknown) => void;
   getKnownState?: (stableSerial: string) => any;
@@ -26,6 +28,10 @@ export function createAdbSupervisor(options?: {
   tryEnableWirelessAdb?: (input?: unknown) => Promise<{ success: boolean; status: string; message?: string }>;
 }): {
   getState: (stableSerial: string) => any;
+  getMetrics: (stableSerial: string) => any;
+  getInFlightCount: () => number;
+  getStateCount: () => number;
+  forget: (stableSerial: string) => boolean;
   tick: (route: any, options?: Record<string, unknown>) => Promise<any>;
   forceReconnect: (stableSerial: string, options?: Record<string, unknown>) => Promise<any>;
 };

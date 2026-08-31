@@ -612,6 +612,7 @@ describe("BizonVR Backend Logic Tests", () => {
     updateCommandStatus(db, commandId, "succeeded");
 
     assert.strictEqual((listDevices(db) as Array<any>).length, 0);
+    assert.strictEqual((updateCommandStatus(db, commandId, "succeeded") as any).idempotent, true);
   });
 
   it("blocks forgetting a Quest while it has an active session", () => {
@@ -789,6 +790,25 @@ describe("BizonVR Backend Logic Tests", () => {
 
     assert.strictEqual((listSessions(db) as Array<any>).find((session) => session.id === sessionId).status, "failed");
     assert.strictEqual((listDevices(db) as Array<any>)[0].status, "error");
+  });
+
+  it("does not convert an unknown START_SESSION outcome into a false session failure", () => {
+    const { db, roomId, deviceId, actor } = createReadyFixture();
+    const sessionId = createSession(db, {
+      title: "Unknown Start",
+      roomId,
+      deviceIds: [deviceId],
+      appPackage: "com.example.game",
+      durationMinutes: 30,
+      actor,
+    });
+    const startCommand = (listCommands(db) as Array<any>).find((command) => command.type === "START_SESSION");
+    updateCommandStatus(db, startCommand.id, "accepted_by_hub");
+    updateCommandStatus(db, startCommand.id, "running");
+    updateCommandStatus(db, startCommand.id, "timeout", "Hub restarted after Agent may have launched", { errorCode: "COMMAND_OUTCOME_UNKNOWN", outcomeState: "unknown" });
+
+    assert.equal((listSessions(db) as Array<any>).find((session) => session.id === sessionId).status, "starting");
+    assert.equal((listCommands(db) as Array<any>).find((command) => command.id === startCommand.id).operator_state, "result_unknown");
   });
 
   it("computes remaining time for a running session and restores it after refresh", () => {

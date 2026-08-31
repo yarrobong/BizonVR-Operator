@@ -64,7 +64,22 @@ class SpatialSessionController(
             hubIp = persistedHubIp,
             hubPort = persistedHubPort,
             footerLine = Build.MODEL ?: "Meta Quest",
-            batteryStatus = currentBatteryStatus()
+            batteryStatus = currentBatteryStatus(),
+            inSession = preferences.getBoolean(KEY_SESSION_IN_SESSION, false),
+            sessionPaused = preferences.getBoolean(KEY_SESSION_PAUSED, false),
+            launcherState = when {
+                !preferences.getBoolean(KEY_SESSION_IN_SESSION, false) -> LauncherState.WAITING
+                preferences.getBoolean(KEY_SESSION_PAUSED, false) -> LauncherState.PAUSED
+                else -> LauncherState.ACTIVE
+            },
+            sessionId = preferences.getLong(KEY_SESSION_ID, -1L).takeIf { it > 0 },
+            sessionRevision = preferences.getLong(KEY_SESSION_REVISION, 0L),
+            sessionStartedAtEpochMs = preferences.getLong(KEY_SESSION_STARTED_AT, -1L).takeIf { it > 0 },
+            sessionTotalPausedSeconds = preferences.getLong(KEY_SESSION_TOTAL_PAUSED, 0L),
+            sessionPausedAtEpochMs = preferences.getLong(KEY_SESSION_PAUSED_AT, -1L).takeIf { it > 0 },
+            pausedRemainingSeconds = preferences.getInt(KEY_SESSION_PAUSED_REMAINING, -1).takeIf { it >= 0 },
+            sessionRemainingSeconds = preferences.getInt(KEY_SESSION_REMAINING, 0),
+            sessionDurationMinutes = preferences.getInt(KEY_SESSION_DURATION, 30)
         )
     )
     val uiState: StateFlow<LauncherUiState> = _uiState.asStateFlow()
@@ -91,20 +106,7 @@ class SpatialSessionController(
                 val snapshot = _uiState.value
                 _uiState.value = snapshot.copy(batteryStatus = currentBatteryStatus())
 
-                if (snapshot.inSession && !snapshot.sessionPaused) {
-                    val nextRemainingSeconds = maxOf(0, snapshot.sessionRemainingSeconds - HEARTBEAT_INTERVAL_SECONDS)
-
-                    when {
-                        nextRemainingSeconds <= 0 -> endSessionAutomatically()
-                        nextRemainingSeconds <= FIVE_MINUTES_SECONDS &&
-                            snapshot.launcherState != LauncherState.FIVE_MIN_WARN ->
-                            transitionTo(
-                                launcherState = LauncherState.FIVE_MIN_WARN,
-                                remainingSeconds = nextRemainingSeconds
-                            )
-                        else -> updateTimer(nextRemainingSeconds)
-                    }
-                }
+                refreshTimerFromClock(autoFinish = true)
 
                 sendHeartbeat()
                 handler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
@@ -117,20 +119,7 @@ class SpatialSessionController(
                 val snapshot = _uiState.value
                 _uiState.value = snapshot.copy(batteryStatus = currentBatteryStatus())
 
-                if (snapshot.inSession && !snapshot.sessionPaused) {
-                    val nextRemainingSeconds = maxOf(0, snapshot.sessionRemainingSeconds - UI_REFRESH_INTERVAL_SECONDS)
-
-                    when {
-                        nextRemainingSeconds <= 0 -> endSessionAutomatically()
-                        nextRemainingSeconds <= FIVE_MINUTES_SECONDS &&
-                            snapshot.launcherState != LauncherState.FIVE_MIN_WARN ->
-                            transitionTo(
-                                launcherState = LauncherState.FIVE_MIN_WARN,
-                                remainingSeconds = nextRemainingSeconds
-                            )
-                        else -> updateTimer(nextRemainingSeconds)
-                    }
-                }
+                refreshTimerFromClock(autoFinish = false)
 
                 handler.postDelayed(this, UI_REFRESH_INTERVAL_MS)
             }
@@ -170,8 +159,15 @@ class SpatialSessionController(
         intent ?: return
         updateHubConnectionFromIntent(intent)
 
+        val incomingSessionId = intent.getLongExtra(EXTRA_SESSION_ID, -1L).takeIf { it > 0 }
+        val incomingRevision = intent.getLongExtra(EXTRA_SESSION_REVISION, 0L)
+
         when (intent.getStringExtra(EXTRA_SESSION_ACTION)) {
             ACTION_START -> {
+                if (_uiState.value.inSession && incomingSessionId != null && _uiState.value.sessionId == incomingSessionId) {
+                    Log.i(TAG, "Duplicate START ignored for session=$incomingSessionId")
+                    return
+                }
                 val durationSeconds = resolveDurationSeconds(intent)
                 val remainingSeconds = resolveRemainingSeconds(intent, durationSeconds)
                 transitionTo(
@@ -182,7 +178,10 @@ class SpatialSessionController(
                     sessionDurationMinutes = maxOf(1, durationSeconds / 60),
                     sessionPackage = intent.getStringExtra(EXTRA_CURRENT_APP_PACKAGE) ?: intent.getStringExtra(EXTRA_PACKAGE),
                     sessionAppName = intent.getStringExtra(EXTRA_CURRENT_APP_NAME) ?: intent.getStringExtra(EXTRA_APP_NAME),
-                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY)
+                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY),
+                    sessionId = incomingSessionId,
+                    sessionRevision = incomingRevision,
+                    sessionStartedAtEpochMs = System.currentTimeMillis()
                 )
 
                 handler.postDelayed({
@@ -204,7 +203,12 @@ class SpatialSessionController(
                     sessionDurationMinutes = maxOf(1, durationSeconds / 60),
                     sessionPackage = intent.getStringExtra(EXTRA_CURRENT_APP_PACKAGE) ?: intent.getStringExtra(EXTRA_PACKAGE),
                     sessionAppName = intent.getStringExtra(EXTRA_CURRENT_APP_NAME) ?: intent.getStringExtra(EXTRA_APP_NAME),
-                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY)
+                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY),
+                    sessionId = incomingSessionId ?: _uiState.value.sessionId,
+                    sessionRevision = incomingRevision,
+                    sessionStartedAtEpochMs = _uiState.value.sessionStartedAtEpochMs ?: System.currentTimeMillis(),
+                    sessionTotalPausedSeconds = _uiState.value.sessionTotalPausedSeconds +
+                        maxOf(0L, ((System.currentTimeMillis() - (_uiState.value.sessionPausedAtEpochMs ?: System.currentTimeMillis())) / 1000L)),
                 )
             }
 
@@ -219,7 +223,11 @@ class SpatialSessionController(
                     sessionDurationMinutes = maxOf(1, durationSeconds / 60),
                     sessionPackage = intent.getStringExtra(EXTRA_CURRENT_APP_PACKAGE) ?: intent.getStringExtra(EXTRA_PACKAGE),
                     sessionAppName = intent.getStringExtra(EXTRA_CURRENT_APP_NAME) ?: intent.getStringExtra(EXTRA_APP_NAME),
-                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY)
+                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY),
+                    sessionId = incomingSessionId ?: _uiState.value.sessionId,
+                    sessionRevision = incomingRevision,
+                    sessionPausedAtEpochMs = System.currentTimeMillis(),
+                    pausedRemainingSeconds = remainingSeconds
                 )
                 callbacks.openLauncher()
             }
@@ -241,7 +249,12 @@ class SpatialSessionController(
                     sessionDurationMinutes = maxOf(1, durationSeconds / 60),
                     sessionPackage = intent.getStringExtra(EXTRA_CURRENT_APP_PACKAGE) ?: intent.getStringExtra(EXTRA_PACKAGE),
                     sessionAppName = intent.getStringExtra(EXTRA_CURRENT_APP_NAME) ?: intent.getStringExtra(EXTRA_APP_NAME),
-                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY)
+                    sessionActivity = intent.getStringExtra(EXTRA_ACTIVITY),
+                    sessionId = incomingSessionId ?: _uiState.value.sessionId,
+                    sessionRevision = incomingRevision,
+                    sessionStartedAtEpochMs = _uiState.value.sessionStartedAtEpochMs ?: System.currentTimeMillis(),
+                    sessionPausedAtEpochMs = null,
+                    pausedRemainingSeconds = null
                 )
                 if (paused) {
                     callbacks.openLauncher()
@@ -253,7 +266,12 @@ class SpatialSessionController(
                     launcherState = LauncherState.FINISHED,
                     inSession = false,
                     sessionPaused = false,
-                    remainingSeconds = 0
+                    remainingSeconds = 0,
+                    sessionId = null,
+                    sessionRevision = incomingRevision,
+                    sessionStartedAtEpochMs = null,
+                    sessionPausedAtEpochMs = null,
+                    pausedRemainingSeconds = null
                 )
                 callbacks.openLauncher()
                 handler.postDelayed(
@@ -380,6 +398,8 @@ class SpatialSessionController(
                 paused = state.sessionPaused,
                 currentAppPackage = state.sessionPackage,
                 currentAppName = state.sessionAppName,
+                sessionId = state.sessionId,
+                sessionRevision = state.sessionRevision,
                 launcherState = state.launcherState,
                 hubIp = state.hubIp,
                 hubPort = state.hubPort,
@@ -414,6 +434,34 @@ class SpatialSessionController(
             )
     }
 
+    private fun persistSessionState(state: LauncherUiState) {
+        preferences.edit()
+            .putBoolean(KEY_SESSION_IN_SESSION, state.inSession)
+            .putBoolean(KEY_SESSION_PAUSED, state.sessionPaused)
+            .putLong(KEY_SESSION_ID, state.sessionId ?: -1L)
+            .putLong(KEY_SESSION_REVISION, state.sessionRevision)
+            .putLong(KEY_SESSION_STARTED_AT, state.sessionStartedAtEpochMs ?: -1L)
+            .putLong(KEY_SESSION_TOTAL_PAUSED, state.sessionTotalPausedSeconds)
+            .putLong(KEY_SESSION_PAUSED_AT, state.sessionPausedAtEpochMs ?: -1L)
+            .putInt(KEY_SESSION_PAUSED_REMAINING, state.pausedRemainingSeconds ?: -1)
+            .putInt(KEY_SESSION_REMAINING, state.sessionRemainingSeconds)
+            .putInt(KEY_SESSION_DURATION, state.sessionDurationMinutes)
+            .apply()
+    }
+
+    private fun refreshTimerFromClock(autoFinish: Boolean) {
+        val state = _uiState.value
+        if (!state.inSession || state.sessionPaused) return
+        val startedAt = state.sessionStartedAtEpochMs ?: return
+        val elapsed = maxOf(0L, (System.currentTimeMillis() - startedAt) / 1000L)
+        val remaining = maxOf(0, state.sessionDurationMinutes * 60 - elapsed.toInt() + state.sessionTotalPausedSeconds.toInt())
+        if (remaining <= 0 && autoFinish) {
+            endSessionAutomatically()
+            return
+        }
+        updateTimer(remaining)
+    }
+
     private fun transitionTo(
         launcherState: LauncherState,
         inSession: Boolean = _uiState.value.inSession,
@@ -422,7 +470,13 @@ class SpatialSessionController(
         sessionDurationMinutes: Int = _uiState.value.sessionDurationMinutes,
         sessionPackage: String? = _uiState.value.sessionPackage,
         sessionAppName: String? = _uiState.value.sessionAppName,
-        sessionActivity: String? = _uiState.value.sessionActivity
+        sessionActivity: String? = _uiState.value.sessionActivity,
+        sessionId: Long? = _uiState.value.sessionId,
+        sessionRevision: Long = _uiState.value.sessionRevision,
+        sessionStartedAtEpochMs: Long? = _uiState.value.sessionStartedAtEpochMs,
+        sessionTotalPausedSeconds: Long = _uiState.value.sessionTotalPausedSeconds,
+        sessionPausedAtEpochMs: Long? = _uiState.value.sessionPausedAtEpochMs,
+        pausedRemainingSeconds: Int? = _uiState.value.pausedRemainingSeconds
     ) {
         val clampedRemainingSeconds = maxOf(0, remainingSeconds)
         val totalSeconds = maxOf(sessionDurationMinutes * 60, clampedRemainingSeconds)
@@ -511,6 +565,14 @@ class SpatialSessionController(
                         showBottomActions = true
                     )
             }
+        persistSessionState(_uiState.value.copy(
+            sessionId = sessionId,
+            sessionRevision = sessionRevision,
+            sessionStartedAtEpochMs = sessionStartedAtEpochMs,
+            sessionTotalPausedSeconds = sessionTotalPausedSeconds,
+            sessionPausedAtEpochMs = sessionPausedAtEpochMs,
+            pausedRemainingSeconds = pausedRemainingSeconds,
+        ))
     }
 
     private fun resolveAvailableGames(): List<LauncherGameEntry> {
@@ -807,6 +869,16 @@ class SpatialSessionController(
         private const val KEY_LAST_SUCCESSFUL_HEARTBEAT_AT = "last_successful_heartbeat_at"
         private const val KEY_APP_VERSION = "app_version"
         private const val KEY_LAST_KNOWN_LOCAL_IP = "last_known_local_ip"
+        private const val KEY_SESSION_IN_SESSION = "session_in_session"
+        private const val KEY_SESSION_PAUSED = "session_paused"
+        private const val KEY_SESSION_ID = "session_id"
+        private const val KEY_SESSION_REVISION = "session_revision"
+        private const val KEY_SESSION_STARTED_AT = "session_started_at"
+        private const val KEY_SESSION_TOTAL_PAUSED = "session_total_paused"
+        private const val KEY_SESSION_PAUSED_AT = "session_paused_at"
+        private const val KEY_SESSION_PAUSED_REMAINING = "session_paused_remaining"
+        private const val KEY_SESSION_REMAINING = "session_remaining"
+        private const val KEY_SESSION_DURATION = "session_duration"
         private const val DEFAULT_HUB_PORT = 3001
 
         private const val EXTRA_SESSION_ACTION = "SESSION_ACTION"
@@ -823,6 +895,8 @@ class SpatialSessionController(
         private const val EXTRA_HUB_IP = "HUB_IP"
         private const val EXTRA_HUB_PORT = "HUB_PORT"
         private const val EXTRA_MESSAGE = "MESSAGE"
+        private const val EXTRA_SESSION_ID = "SESSION_ID"
+        private const val EXTRA_SESSION_REVISION = "SESSION_REVISION"
 
         private const val ACTION_START = "START"
         private const val ACTION_RESUME = "RESUME"

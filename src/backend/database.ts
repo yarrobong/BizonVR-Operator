@@ -98,6 +98,18 @@ type CreateCommandInput = {
   actor?: PermissionActor | null;
 };
 
+type CommandStatusOptions = {
+  errorCode?: string | null;
+  result?: Record<string, unknown> | null;
+  outcomeState?: "pending" | "known" | "unknown" | "reconciled";
+  hubId?: number | null;
+  hubInstanceId?: string | null;
+  claimToken?: string | null;
+  route?: string | null;
+  reconciled?: boolean;
+  resultDeliveryAttempt?: number | null;
+};
+
 type CreateSessionInput = {
   title: string;
   roomId?: number | null;
@@ -109,6 +121,10 @@ type CreateSessionInput = {
   operatorNotes?: string;
   createdByUserId?: number | null;
   actor?: PermissionActor | null;
+};
+
+type SessionActionInput = {
+  idempotencyKey?: string | null;
 };
 
 export type PermissionActor = {
@@ -127,6 +143,20 @@ type SubscriptionState = {
 const PACKAGE_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/;
 const ACTIVE_SESSION_STATUSES = ["preparing", "ready", "starting", "running", "paused", "extended", "finishing"];
 const ACTIVE_SESSION_DEVICE_STATUSES = ["preparing", "ready", "running", "paused"];
+const TERMINAL_SESSION_STATUSES = ["completed", "cancelled", "failed"];
+const SESSION_STATUS_TRANSITIONS: Record<string, string[]> = {
+  draft: ["preparing", "cancelled"],
+  preparing: ["ready", "starting", "finishing", "cancelled", "failed"],
+  ready: ["starting", "finishing", "cancelled", "failed"],
+  starting: ["running", "finishing", "cancelled", "failed"],
+  running: ["paused", "extended", "finishing", "failed"],
+  paused: ["running", "extended", "finishing", "failed"],
+  extended: ["running", "paused", "finishing", "failed"],
+  finishing: ["completed", "failed"],
+  completed: [],
+  cancelled: [],
+  failed: [],
+};
 const TECHNICAL_COMMAND_TYPES = new Set([
   "INSTALL_APP",
   "INSTALL_APK",
@@ -143,6 +173,7 @@ const SESSION_CONTROL_COMMAND_TYPES = new Set([
   "START_SESSION",
   "PAUSE_SESSION",
   "RESUME_SESSION",
+  "EXTEND_SESSION",
   "SWITCH_SESSION_APP",
   "END_SESSION",
 ]);
@@ -389,6 +420,7 @@ type SyncPayload = {
   active_serials?: string[];
   device_details?: DeviceDetail[];
   hub_host?: string;
+  hub_instance_id?: string;
   agent_heartbeats?: Array<{
     agent_id?: string;
     pairing_id?: string;
@@ -397,6 +429,8 @@ type SyncPayload = {
     model?: string;
     session_seconds?: number;
     remaining_seconds?: number;
+    session_id?: number | null;
+    session_revision?: number;
     session_status?: string;
     paused?: boolean;
     current_app_package?: string;
@@ -407,6 +441,7 @@ type SyncPayload = {
     battery_level?: number;
     charging_state?: string;
     foreground_state?: string;
+    timestamp?: number;
   }>;
 };
 
@@ -418,6 +453,59 @@ type DeviceIdentity = {
 };
 
 const QUEST_AGENT_PACKAGE = process.env.QUEST_AGENT_PACKAGE || "com.bizonvr.spatialspike";
+
+const COMMAND_TYPES = new Set([
+  "PING", "REFRESH_STATUS", "INSTALL_APP", "INSTALL_APK", "UNINSTALL_APP", "LAUNCH_APP", "STOP_APP",
+  "REBOOT_DEVICE", "OPEN_SCRCPY", "CLOSE_SCRCPY", "SHOW_MESSAGE", "START_SESSION", "PAUSE_SESSION",
+  "RESUME_SESSION", "EXTEND_SESSION", "SWITCH_SESSION_APP", "END_SESSION", "OPEN_LAUNCHER", "RUN_DIAGNOSTICS", "FORGET_DEVICE",
+]);
+
+const COMMAND_POLICIES: Record<string, { maxAttempts: number; retryable: boolean; reconciliable: boolean; dangerous: boolean }> = {
+  PING: { maxAttempts: 3, retryable: true, reconciliable: false, dangerous: false },
+  REFRESH_STATUS: { maxAttempts: 3, retryable: true, reconciliable: false, dangerous: false },
+  RUN_DIAGNOSTICS: { maxAttempts: 3, retryable: true, reconciliable: false, dangerous: false },
+  OPEN_LAUNCHER: { maxAttempts: 2, retryable: true, reconciliable: true, dangerous: false },
+  LAUNCH_APP: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: false },
+  STOP_APP: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: false },
+  OPEN_SCRCPY: { maxAttempts: 2, retryable: true, reconciliable: true, dangerous: false },
+  CLOSE_SCRCPY: { maxAttempts: 2, retryable: true, reconciliable: true, dangerous: false },
+  RECONNECT_ADB: { maxAttempts: 3, retryable: true, reconciliable: false, dangerous: false },
+  INSTALL_APP: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: true },
+  INSTALL_APK: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: true },
+  UNINSTALL_APP: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: true },
+  START_SESSION: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: true },
+  PAUSE_SESSION: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: true },
+  RESUME_SESSION: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: true },
+  EXTEND_SESSION: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: true },
+  SWITCH_SESSION_APP: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: true },
+  END_SESSION: { maxAttempts: 1, retryable: false, reconciliable: true, dangerous: true },
+  FORGET_DEVICE: { maxAttempts: 1, retryable: false, reconciliable: false, dangerous: true },
+  REBOOT_DEVICE: { maxAttempts: 1, retryable: false, reconciliable: false, dangerous: true },
+};
+
+function canonicalizeJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value as Record<string, unknown>).sort().map((key) => [key, canonicalizeJson((value as Record<string, unknown>)[key])]));
+  }
+  return value;
+}
+
+export function canonicalCommandPayload(payload: Record<string, unknown> | string | null | undefined) {
+  let parsed: unknown = payload ?? {};
+  if (typeof parsed === "string") {
+    try { parsed = JSON.parse(parsed || "{}"); } catch { parsed = {}; }
+  }
+  return JSON.stringify(canonicalizeJson(parsed || {}));
+}
+
+export function commandPayloadHash(payload: Record<string, unknown> | string | null | undefined) {
+  return crypto.createHash("sha256").update(canonicalCommandPayload(payload)).digest("hex");
+}
+
+export function getCommandPolicy(type: string) {
+  return COMMAND_POLICIES[type] ?? { maxAttempts: 1, retryable: false, reconciliable: false, dangerous: true };
+}
 
 function readMigration(relativePath: string) {
   return fs.readFileSync(path.join(process.cwd(), relativePath), "utf8");
@@ -472,6 +560,9 @@ function ensureSchemaCompatibility(db: SqliteDatabase, migrationFile?: string) {
       db.exec(`UPDATE session_devices SET current_app_package = COALESCE(current_app_package, launch_package_name) WHERE current_app_package IS NULL`);
     }
   }
+  // Older test/dev databases may contain only the device inventory tables and
+  // no command table at all.  They are valid partial legacy databases; the
+  // normal migration will add command reliability fields once commands exist.
 }
 
 function applyMigrations(db: SqliteDatabase) {
@@ -507,7 +598,7 @@ function applyMigrations(db: SqliteDatabase) {
     try {
       db.exec(readMigration(path.join("db", "migrations", migrationFile)));
     } catch (error) {
-      if (!["0002_device_route_columns.sql", "0004_session_lifecycle.sql"].includes(migrationFile)) {
+      if (!["0002_device_route_columns.sql", "0004_session_lifecycle.sql", "0005_device_command_reliability.sql", "0006_session_reliability.sql"].includes(migrationFile)) {
         throw error;
       }
       ensureSchemaCompatibility(db, migrationFile);
@@ -515,6 +606,25 @@ function applyMigrations(db: SqliteDatabase) {
 
     ensureSchemaCompatibility(db, migrationFile);
     db.prepare(`INSERT INTO schema_migrations (version) VALUES (?)`).run(migrationFile);
+  }
+
+  // 0005 adds the durable command fields. Backfill hashes in application code
+  // so the canonical JSON representation is identical in Cloud and Local Hub.
+  const reliabilityColumns = new Set((db.prepare(`PRAGMA table_info(device_commands)`).all() as Array<{ name: string }>).map((column) => column.name));
+  if (reliabilityColumns.has("payload_sha256")) {
+    const commands = db.prepare(`SELECT id, type, payload FROM device_commands WHERE payload_sha256 = '' OR payload_sha256 IS NULL`).all() as Array<{ id: number; type: string; payload: string }>;
+    const updateHash = db.prepare(`UPDATE device_commands SET payload_sha256 = ?, max_attempts = ? WHERE id = ?`);
+    const backfill = db.transaction(() => {
+      for (const command of commands) updateHash.run(commandPayloadHash(command.payload), getCommandPolicy(command.type).maxAttempts, command.id);
+    });
+    backfill();
+    db.exec(`
+      UPDATE device_commands
+      SET target_stable_id = COALESCE(target_stable_id, (SELECT stable_id FROM devices WHERE devices.id = device_commands.device_id)),
+          target_android_id = COALESCE(target_android_id, (SELECT android_id FROM devices WHERE devices.id = device_commands.device_id)),
+          target_agent_id = COALESCE(target_agent_id, (SELECT agent_id FROM devices WHERE devices.id = device_commands.device_id))
+      WHERE target_stable_id IS NULL OR target_android_id IS NULL OR target_agent_id IS NULL
+    `);
   }
 }
 
@@ -843,6 +953,9 @@ function getDeviceContext(db: SqliteDatabase, deviceId: number) {
       d.battery_percent,
       d.storage_free_mb,
       d.storage_total_mb,
+      d.stable_id,
+      d.android_id,
+      d.agent_id,
       c.organization_id
     FROM devices d
     JOIN clubs c ON c.id = d.club_id
@@ -859,12 +972,31 @@ function getDeviceContext(db: SqliteDatabase, deviceId: number) {
         battery_percent: number;
         storage_free_mb: number | null;
         storage_total_mb: number | null;
+        stable_id: string | null;
+        android_id: string | null;
+        agent_id: string | null;
         organization_id: number;
       }
     | undefined;
 }
 
 export function createDeviceCommand(db: SqliteDatabase, input: CreateCommandInput) {
+  if (!COMMAND_TYPES.has(input.type)) {
+    throw new Error(`Unsupported device command type: ${input.type}`);
+  }
+  if (input.type === "RUN_SHELL" || input.type === "EXECUTE_SHELL") {
+    throw new Error("Arbitrary shell commands are not supported");
+  }
+  const payload = input.payload ?? {};
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("Command payload must be a JSON object");
+  }
+  for (const key of ["package", "package_name", "app_package", "current_app_package"]) {
+    const candidate = payload[key];
+    if (candidate !== undefined && (typeof candidate !== "string" || !isValidPackageName(candidate))) {
+      throw new Error(`Invalid package name in command payload: ${key}`);
+    }
+  }
   const context = getDeviceContext(db, input.deviceId);
   if (!context) {
     throw new Error("Device not found");
@@ -891,10 +1023,14 @@ export function createDeviceCommand(db: SqliteDatabase, input: CreateCommandInpu
     throw new Error("Local Hub is not in the same club as device");
   }
 
+  const payloadJson = canonicalCommandPayload(payload);
+  const payloadHash = commandPayloadHash(payloadJson);
+  const policy = getCommandPolicy(input.type);
   const result = db.prepare(`
     INSERT INTO device_commands (
-      organization_id, club_id, local_hub_id, device_id, session_id, type, payload, status, created_by_user_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'created', ?)
+      organization_id, club_id, local_hub_id, device_id, session_id, type, payload, payload_sha256,
+      status, max_attempts, target_stable_id, target_android_id, target_agent_id, created_by_user_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?, ?)
   `).run(
     context.organization_id,
     context.club_id,
@@ -902,7 +1038,12 @@ export function createDeviceCommand(db: SqliteDatabase, input: CreateCommandInpu
     input.deviceId,
     input.sessionId ?? null,
     input.type,
-    JSON.stringify(input.payload ?? {}),
+    payloadJson,
+    payloadHash,
+    policy.maxAttempts,
+    context.stable_id || context.id.toString(),
+    context.android_id,
+    context.agent_id,
     input.createdByUserId ?? null,
   );
 
@@ -970,6 +1111,15 @@ type ActiveSessionRow = {
   current_app_package: string | null;
   current_app_name: string | null;
   last_app_switch_at: string | null;
+  session_revision: number;
+  session_recovery_state: string;
+  device_revision: number;
+  operation_state: string;
+  desired_app_package: string | null;
+  desired_app_activity: string | null;
+  last_command_id: number | null;
+  agent_session_id: number | null;
+  last_agent_timestamp_ms: number | null;
 };
 
 export type ActiveSessionSummary = {
@@ -982,13 +1132,17 @@ export type ActiveSessionSummary = {
   paused_at: string | null;
   total_paused_seconds: number;
   remaining_seconds: number;
-  status: "running" | "paused" | "ended";
+  status: "starting" | "running" | "paused" | "finishing" | "ended";
   app_package: string;
   app_name: string | null;
   current_app_package: string;
   current_app_name: string | null;
   last_app_switch_at: string | null;
   is_expired: boolean;
+  revision?: number;
+  operation_state?: string;
+  desired_app_package?: string | null;
+  recovery_state?: string;
 };
 
 function resolveAppName(db: SqliteDatabase, packageName: string | null | undefined) {
@@ -1034,6 +1188,10 @@ function mapActiveSessionRow(row: ActiveSessionRow | undefined | null, now = new
   const currentAppName = row.current_app_name ?? row.launch_app_name ?? null;
   const status = row.finished_at
     ? "ended"
+    : row.session_status === "finishing"
+      ? "finishing"
+      : ["preparing", "ready", "starting"].includes(row.session_status)
+        ? "starting"
     : row.session_device_status === "paused"
       ? "paused"
       : "running";
@@ -1055,6 +1213,10 @@ function mapActiveSessionRow(row: ActiveSessionRow | undefined | null, now = new
     current_app_name: currentAppName,
     last_app_switch_at: row.last_app_switch_at,
     is_expired: remainingSeconds <= 0 && !row.finished_at,
+    revision: Number(row.device_revision ?? row.session_revision ?? 0),
+    operation_state: row.operation_state ?? "idle",
+    desired_app_package: row.desired_app_package ?? null,
+    recovery_state: row.session_recovery_state ?? "none",
   };
 }
 
@@ -1080,7 +1242,16 @@ function getActiveSessionRowForDevice(db: SqliteDatabase, deviceId: number) {
       launch_app.name AS launch_app_name,
       COALESCE(sd.current_app_package, sd.launch_package_name) AS current_app_package,
       COALESCE(sd.current_app_name, current_app.name, launch_app.name) AS current_app_name,
-      sd.last_app_switch_at
+      sd.last_app_switch_at,
+      s.revision AS session_revision,
+      s.recovery_state AS session_recovery_state,
+      sd.revision AS device_revision,
+      sd.operation_state,
+      sd.desired_app_package,
+      sd.desired_app_activity,
+      sd.last_command_id,
+      sd.agent_session_id,
+      sd.last_agent_timestamp_ms
     FROM session_devices sd
     JOIN sessions s ON s.id = sd.session_id
     JOIN devices d ON d.id = sd.device_id
@@ -1120,7 +1291,16 @@ function getActiveSessionRowBySessionId(db: SqliteDatabase, sessionId: number) {
       launch_app.name AS launch_app_name,
       COALESCE(sd.current_app_package, sd.launch_package_name) AS current_app_package,
       COALESCE(sd.current_app_name, current_app.name, launch_app.name) AS current_app_name,
-      sd.last_app_switch_at
+      sd.last_app_switch_at,
+      s.revision AS session_revision,
+      s.recovery_state AS session_recovery_state,
+      sd.revision AS device_revision,
+      sd.operation_state,
+      sd.desired_app_package,
+      sd.desired_app_activity,
+      sd.last_command_id,
+      sd.agent_session_id,
+      sd.last_agent_timestamp_ms
     FROM sessions s
     JOIN session_devices sd ON sd.session_id = s.id
     JOIN devices d ON d.id = sd.device_id
@@ -1159,18 +1339,188 @@ function buildSessionStatePayload(summary: ActiveSessionSummary) {
     last_app_switch_at: summary.last_app_switch_at,
     total_paused_seconds: summary.total_paused_seconds,
     is_expired: summary.is_expired,
+    revision: summary.revision ?? 0,
+    operation_state: summary.operation_state ?? "idle",
   };
 }
 
+function transitionSessionStatus(db: SqliteDatabase, sessionId: number, nextStatus: string, expectedStatuses?: string[]) {
+  const current = db.prepare(`SELECT status FROM sessions WHERE id = ?`).get(sessionId) as { status: string } | undefined;
+  if (!current) throw new Error("Session not found");
+  if (current.status === nextStatus) return false;
+  if (TERMINAL_SESSION_STATUSES.includes(current.status)) {
+    throw new Error(`Invalid session transition: ${current.status} -> ${nextStatus}`);
+  }
+  if (expectedStatuses && !expectedStatuses.includes(current.status)) {
+    throw new Error(`Invalid session transition: ${current.status} -> ${nextStatus}`);
+  }
+  if (!SESSION_STATUS_TRANSITIONS[current.status]?.includes(nextStatus)) {
+    throw new Error(`Invalid session transition: ${current.status} -> ${nextStatus}`);
+  }
+  const updated = db.prepare(`
+    UPDATE sessions
+    SET status = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND status = ?
+  `).run(nextStatus, sessionId, current.status);
+  if (updated.changes !== 1) throw new Error(`Session ${sessionId} changed concurrently`);
+  return true;
+}
+
+function refreshSessionAggregate(db: SqliteDatabase, sessionId: number) {
+  const session = db.prepare(`SELECT status FROM sessions WHERE id = ?`).get(sessionId) as { status: string } | undefined;
+  if (!session || TERMINAL_SESSION_STATUSES.includes(session.status) || session.status === "finishing") return session?.status;
+  const rows = db.prepare(`SELECT status FROM session_devices WHERE session_id = ?`).all(sessionId) as Array<{ status: string }>;
+  const statuses = rows.map((row) => row.status);
+  if (statuses.length === 0) return session.status;
+  const target = statuses.every((status) => status === "finished")
+    ? "completed"
+    : statuses.every((status) => status === "failed")
+      ? "failed"
+      : statuses.some((status) => status === "running")
+        ? "running"
+        : statuses.some((status) => status === "paused")
+          ? (statuses.every((status) => ["paused", "failed", "finished"].includes(status)) ? "paused" : "running")
+          : statuses.some((status) => ["preparing", "ready"].includes(status))
+            ? "starting"
+            : session.status;
+  if (target !== session.status && SESSION_STATUS_TRANSITIONS[session.status]?.includes(target)) {
+    db.prepare(`UPDATE sessions SET status = ?, revision = revision + 1, finished_at = CASE WHEN ? IN ('completed', 'failed') THEN COALESCE(finished_at, CURRENT_TIMESTAMP) ELSE finished_at END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?`)
+      .run(target, target, sessionId, session.status);
+  }
+  return target;
+}
+
+function appendSessionActionRequest(db: SqliteDatabase, input: {
+  sessionId: number;
+  deviceId: number;
+  action: string;
+  idempotencyKey?: string | null;
+  commandId: number;
+  revision: number;
+}) {
+  if (!input.idempotencyKey) return;
+  db.prepare(`
+    INSERT OR IGNORE INTO session_action_requests
+      (session_id, device_id, action, idempotency_key, command_id, revision)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(input.sessionId, input.deviceId, input.action, input.idempotencyKey, input.commandId, input.revision);
+}
+
+function findExistingSessionAction(db: SqliteDatabase, sessionId: number, deviceId: number, action: string, idempotencyKey?: string | null) {
+  if (!idempotencyKey) return undefined;
+  return db.prepare(`
+    SELECT command_id, revision FROM session_action_requests
+    WHERE session_id = ? AND device_id = ? AND action = ? AND idempotency_key = ?
+    LIMIT 1
+  `).get(sessionId, deviceId, action, idempotencyKey) as { command_id: number | null; revision: number } | undefined;
+}
+
+export function extendSession(
+  db: SqliteDatabase,
+  sessionId: number,
+  minutes: number,
+  actor?: PermissionActor | null,
+  options: SessionActionInput = {},
+) {
+  const active = resolveActiveSessionReference(db, sessionId, "session");
+  if (!active) throw new Error("Active session not found");
+  if (!Number.isInteger(minutes) || minutes <= 0 || minutes > 24 * 60) {
+    throw new Error("Extension must be a positive whole number of minutes");
+  }
+  if (!['running', 'paused'].includes(active.session_device_status)) {
+    throw new Error("Extend is only available for a running or paused session");
+  }
+  assertActorCanAccessClub(actor, active.organization_id, active.club_id);
+  assertRole(actor, ["owner", "admin", "operator"], "extend session");
+  assertSubscriptionFeature(db, active.organization_id, "sessions");
+  if (!active.local_hub_id) throw new Error("Device is not attached to a Local Hub");
+  if (findExistingSessionAction(db, active.session_id, active.device_id, "extend", options.idempotencyKey)) {
+    return getActiveSessionForDevice(db, active.device_id);
+  }
+
+  const tx = db.transaction(() => {
+    const nextSessionStatus = active.session_device_status === "paused" ? "extended" : "extended";
+    const marked = db.prepare(`
+      UPDATE session_devices
+      SET revision = revision + 1, operation_state = 'extend_pending', updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status IN ('running', 'paused') AND operation_state = 'idle'
+    `).run(active.session_device_id);
+    if (marked.changes !== 1) {
+      if (findExistingSessionAction(db, active.session_id, active.device_id, "extend", options.idempotencyKey)) {
+        return getActiveSessionForDevice(db, active.device_id);
+      }
+      throw new Error("Session action is already in progress");
+    }
+    if (active.session_status !== nextSessionStatus) transitionSessionStatus(db, active.session_id, nextSessionStatus, ["running", "paused", "extended"]);
+    db.prepare(`
+      UPDATE sessions
+      SET extension_minutes = extension_minutes + ?, revision = revision + 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status = 'extended'
+    `).run(minutes, active.session_id);
+    const summary = getActiveSessionForDevice(db, active.device_id);
+    const extensionPayload = {
+      package: active.current_app_package ?? active.launch_package_name,
+      extension_minutes: minutes,
+      session_state: summary ? buildSessionStatePayload(summary) : undefined,
+    };
+    let commandId: number;
+    try {
+      commandId = createDeviceCommand(db, {
+        deviceId: active.device_id,
+        localHubId: active.local_hub_id,
+        type: "EXTEND_SESSION",
+        sessionId: active.session_id,
+        actor: actor ?? null,
+        payload: extensionPayload,
+      });
+    } catch (error) {
+      // Databases upgraded from the pre-0006 command CHECK constraint use the
+      // existing idempotent RESUME transport as a sync-only compatibility
+      // path. Fresh databases use the explicit EXTEND_SESSION command.
+      if (!String(error).includes("CHECK constraint failed")) throw error;
+      commandId = createDeviceCommand(db, {
+        deviceId: active.device_id,
+        localHubId: active.local_hub_id,
+        type: "RESUME_SESSION",
+        sessionId: active.session_id,
+        actor: actor ?? null,
+        payload: { ...extensionPayload, resync_only: true },
+      });
+    }
+    db.prepare(`UPDATE session_devices SET last_command_id = ? WHERE id = ?`).run(commandId, active.session_device_id);
+    const revision = db.prepare(`SELECT revision FROM session_devices WHERE id = ?`).get(active.session_device_id) as { revision: number };
+    appendSessionActionRequest(db, {
+      sessionId: active.session_id,
+      deviceId: active.device_id,
+      action: "extend",
+      idempotencyKey: options.idempotencyKey,
+      commandId,
+      revision: revision.revision,
+    });
+    appendSessionEvent(db, {
+      sessionId: active.session_id,
+      sessionDeviceId: active.session_device_id,
+      deviceId: active.device_id,
+      type: "session_extended",
+      message: `Session ${active.session_id} extended by ${minutes} minutes`,
+      payload: { extension_minutes: minutes, command_id: commandId, idempotency_key: options.idempotencyKey ?? null },
+    });
+  });
+  tx();
+  return getActiveSessionForDevice(db, active.device_id);
+}
+
 export function createSession(db: SqliteDatabase, input: CreateSessionInput) {
-  if (input.deviceIds.length === 0) {
+  const deviceIds = [...new Set(input.deviceIds.map(Number).filter(Number.isInteger))];
+  if (deviceIds.length === 0) {
     throw new Error("At least one device is required");
   }
   if (!isValidPackageName(input.appPackage)) {
     throw new Error("Invalid app package name");
   }
 
-  const firstDevice = getDeviceContext(db, input.deviceIds[0]);
+  const firstDevice = getDeviceContext(db, deviceIds[0]);
   if (!firstDevice) {
     throw new Error("Primary device not found");
   }
@@ -1184,7 +1534,7 @@ export function createSession(db: SqliteDatabase, input: CreateSessionInput) {
     assertSubscriptionFeature(db, firstDevice.organization_id, "scrcpy");
   }
   assertDeviceLimit(db, firstDevice.organization_id);
-  const preflight = validateSessionPreflight(db, input, firstDevice);
+  const preflight = validateSessionPreflight(db, { ...input, deviceIds }, firstDevice);
   if (!preflight.ok) {
     throw new Error(`Preflight failed: ${preflight.errors.join("; ")}`);
   }
@@ -1218,13 +1568,16 @@ export function createSession(db: SqliteDatabase, input: CreateSessionInput) {
     );
 
     const sessionId = Number(sessionResult.lastInsertRowid);
-    for (const deviceId of input.deviceIds) {
+    db.prepare(`UPDATE sessions SET revision = 1 WHERE id = ?`).run(sessionId);
+    for (const deviceId of deviceIds) {
       const context = getDeviceContext(db, deviceId);
       if (!context || context.club_id !== firstDevice.club_id) {
         throw new Error("All session devices must belong to the same club");
       }
 
-      const sessionDeviceResult = insertSessionDevice.run(
+      let sessionDeviceResult;
+      try {
+        sessionDeviceResult = insertSessionDevice.run(
         sessionId,
         deviceId,
         input.appPackage,
@@ -1232,7 +1585,19 @@ export function createSession(db: SqliteDatabase, input: CreateSessionInput) {
         appName,
         requireScrcpy,
         requireScrcpy,
-      );
+        );
+      } catch (error) {
+        if (String(error).includes("uq_session_devices_one_active_per_device") || String(error).includes("UNIQUE constraint failed: session_devices.device_id")) {
+          throw new Error(`Device ${deviceId} already has active session`);
+        }
+        throw error;
+      }
+      const sessionDeviceId = Number(sessionDeviceResult.lastInsertRowid);
+      db.prepare(`
+        UPDATE session_devices
+        SET revision = 1, operation_state = 'start_pending'
+        WHERE id = ?
+      `).run(sessionDeviceId);
 
       db.prepare(`
         UPDATE devices
@@ -1268,13 +1633,17 @@ export function createSession(db: SqliteDatabase, input: CreateSessionInput) {
             last_app_switch_at: null,
             total_paused_seconds: 0,
             is_expired: false,
+            revision: 1,
+            operation_state: "start_pending",
           },
         },
       });
+      const startCommand = db.prepare(`SELECT id FROM device_commands WHERE session_id = ? AND device_id = ? AND type = 'START_SESSION' ORDER BY id DESC LIMIT 1`).get(sessionId, deviceId) as { id: number };
+      db.prepare(`UPDATE session_devices SET last_command_id = ? WHERE id = ?`).run(startCommand.id, sessionDeviceId);
 
       appendSessionEvent(db, {
         sessionId,
-        sessionDeviceId: Number(sessionDeviceResult.lastInsertRowid),
+        sessionDeviceId,
         deviceId,
         type: "session_device_preparing",
         message: `Device ${deviceId} is preparing session ${sessionId}`,
@@ -1384,7 +1753,7 @@ function validateSessionPreflight(db: SqliteDatabase, input: CreateSessionInput,
   return { ok: errors.length === 0, errors, checks };
 }
 
-export function finishActiveSessionForDevice(db: SqliteDatabase, deviceId: number, actor?: PermissionActor | null) {
+export function finishActiveSessionForDevice(db: SqliteDatabase, deviceId: number, actor?: PermissionActor | null, options: SessionActionInput = {}) {
   const active = getActiveSessionRowForDevice(db, deviceId);
 
   if (!active) {
@@ -1397,18 +1766,27 @@ export function finishActiveSessionForDevice(db: SqliteDatabase, deviceId: numbe
     throw new Error("Device is not attached to a Local Hub");
   }
 
+  const existingAction = findExistingSessionAction(db, active.session_id, deviceId, "end", options.idempotencyKey);
+  if (existingAction) return active.session_id;
+  if (active.session_status === "finishing" || active.operation_state === "finish_pending") {
+    return active.session_id;
+  }
+
   const tx = db.transaction(() => {
-    db.prepare(`
+    const marked = db.prepare(`
       UPDATE session_devices
-      SET status = CASE WHEN status = 'preparing' THEN 'preparing' ELSE status END,
+      SET revision = revision + 1,
+          operation_state = 'finish_pending',
           end_reason = 'operator_stop',
           updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
+      WHERE id = ? AND status IN ('preparing', 'ready', 'running', 'paused') AND operation_state != 'finish_pending'
     `).run(active.session_device_id);
+    if (marked.changes !== 1) {
+      return active.session_id;
+    }
 
-    db.prepare(`
-      UPDATE sessions SET status = 'finishing', updated_at = CURRENT_TIMESTAMP WHERE id = ?
-    `).run(active.session_id);
+    transitionSessionStatus(db, active.session_id, "finishing");
+    const revisionRow = db.prepare(`SELECT revision FROM session_devices WHERE id = ?`).get(active.session_device_id) as { revision: number };
 
     const summary = mapActiveSessionRow({
       ...active,
@@ -1427,6 +1805,16 @@ export function finishActiveSessionForDevice(db: SqliteDatabase, deviceId: numbe
         session_state: summary ? buildSessionStatePayload({ ...summary, status: "ended", remaining_seconds: summary.remaining_seconds }) : undefined,
       },
     });
+    const endCommand = db.prepare(`SELECT id FROM device_commands WHERE session_id = ? AND device_id = ? AND type = 'END_SESSION' ORDER BY id DESC LIMIT 1`).get(active.session_id, deviceId) as { id: number };
+    db.prepare(`UPDATE session_devices SET last_command_id = ? WHERE id = ?`).run(endCommand.id, active.session_device_id);
+    appendSessionActionRequest(db, {
+      sessionId: active.session_id,
+      deviceId,
+      action: "end",
+      idempotencyKey: options.idempotencyKey,
+      commandId: endCommand.id,
+      revision: revisionRow.revision,
+    });
 
     appendSessionEvent(db, {
       sessionId: active.session_id,
@@ -1443,10 +1831,14 @@ export function finishActiveSessionForDevice(db: SqliteDatabase, deviceId: numbe
   return tx();
 }
 
-export function pauseSession(db: SqliteDatabase, sessionId: number, actor?: PermissionActor | null) {
+export function pauseSession(db: SqliteDatabase, sessionId: number, actor?: PermissionActor | null, options: SessionActionInput = {}) {
   const active = resolveActiveSessionReference(db, sessionId, "session");
   if (!active) {
     throw new Error("Active session not found");
+  }
+  if (options.idempotencyKey) {
+    const existingAction = findExistingSessionAction(db, active.session_id, active.device_id, "pause", options.idempotencyKey);
+    if (existingAction) return getActiveSessionForDevice(db, active.device_id);
   }
   if (active.session_device_status !== "running") {
     throw new Error("Pause is only available for a running session");
@@ -1462,20 +1854,24 @@ export function pauseSession(db: SqliteDatabase, sessionId: number, actor?: Perm
   const pausedAt = formatSqliteTimestamp(new Date());
   const previousSummary = mapActiveSessionRow(active);
   const tx = db.transaction(() => {
-    db.prepare(`
+    const marked = db.prepare(`
       UPDATE session_devices
       SET status = 'paused',
+          revision = revision + 1,
+          operation_state = 'pause_pending',
           paused_at = ?,
           paused_remaining_seconds = ?,
           updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
+      WHERE id = ? AND status = 'running' AND operation_state = 'idle'
     `).run(pausedAt, remainingSeconds, active.session_device_id);
+    if (marked.changes !== 1) {
+      if (findExistingSessionAction(db, active.session_id, active.device_id, "pause", options.idempotencyKey)) {
+        return getActiveSessionForDevice(db, active.device_id);
+      }
+      throw new Error("Session action is already in progress");
+    }
 
-    db.prepare(`
-      UPDATE sessions
-      SET status = 'paused', updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(active.session_id);
+    transitionSessionStatus(db, active.session_id, "paused", ["running", "extended"]);
 
     const summary = getActiveSessionForDevice(db, active.device_id);
     createDeviceCommand(db, {
@@ -1492,6 +1888,17 @@ export function pauseSession(db: SqliteDatabase, sessionId: number, actor?: Perm
         session_state: summary ? buildSessionStatePayload(summary) : undefined,
       },
     });
+    const pauseCommand = db.prepare(`SELECT id FROM device_commands WHERE session_id = ? AND device_id = ? AND type = 'PAUSE_SESSION' ORDER BY id DESC LIMIT 1`).get(active.session_id, active.device_id) as { id: number };
+    const revisionRow = db.prepare(`SELECT revision FROM session_devices WHERE id = ?`).get(active.session_device_id) as { revision: number };
+    db.prepare(`UPDATE session_devices SET last_command_id = ? WHERE id = ?`).run(pauseCommand.id, active.session_device_id);
+    appendSessionActionRequest(db, {
+      sessionId: active.session_id,
+      deviceId: active.device_id,
+      action: "pause",
+      idempotencyKey: options.idempotencyKey,
+      commandId: pauseCommand.id,
+      revision: revisionRow.revision,
+    });
 
     appendSessionEvent(db, {
       sessionId: active.session_id,
@@ -1507,10 +1914,14 @@ export function pauseSession(db: SqliteDatabase, sessionId: number, actor?: Perm
   return getActiveSessionForDevice(db, active.device_id);
 }
 
-export function resumeSession(db: SqliteDatabase, sessionId: number, actor?: PermissionActor | null) {
+export function resumeSession(db: SqliteDatabase, sessionId: number, actor?: PermissionActor | null, options: SessionActionInput = {}) {
   const active = resolveActiveSessionReference(db, sessionId, "session");
   if (!active) {
     throw new Error("Active session not found");
+  }
+  if (options.idempotencyKey) {
+    const existingAction = findExistingSessionAction(db, active.session_id, active.device_id, "resume", options.idempotencyKey);
+    if (existingAction) return getActiveSessionForDevice(db, active.device_id);
   }
   if (active.session_device_status !== "paused") {
     throw new Error("Resume is only available for a paused session");
@@ -1528,21 +1939,25 @@ export function resumeSession(db: SqliteDatabase, sessionId: number, actor?: Per
   const previousSummary = mapActiveSessionRow(active);
 
   const tx = db.transaction(() => {
-    db.prepare(`
+    const marked = db.prepare(`
       UPDATE session_devices
       SET status = 'running',
+          revision = revision + 1,
+          operation_state = 'resume_pending',
           paused_at = NULL,
           paused_remaining_seconds = NULL,
           total_paused_seconds = total_paused_seconds + ?,
           updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
+      WHERE id = ? AND status = 'paused' AND operation_state IN ('idle', 'pause_pending')
     `).run(additionalPausedSeconds, active.session_device_id);
+    if (marked.changes !== 1) {
+      if (findExistingSessionAction(db, active.session_id, active.device_id, "resume", options.idempotencyKey)) {
+        return getActiveSessionForDevice(db, active.device_id);
+      }
+      throw new Error("Session action is already in progress");
+    }
 
-    db.prepare(`
-      UPDATE sessions
-      SET status = 'running', updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(active.session_id);
+    transitionSessionStatus(db, active.session_id, "running", ["paused", "extended"]);
 
     const summary = getActiveSessionForDevice(db, active.device_id);
     createDeviceCommand(db, {
@@ -1559,6 +1974,17 @@ export function resumeSession(db: SqliteDatabase, sessionId: number, actor?: Per
         previous_session_state: previousSummary ? buildSessionStatePayload(previousSummary) : undefined,
         session_state: summary ? buildSessionStatePayload(summary) : undefined,
       },
+    });
+    const resumeCommand = db.prepare(`SELECT id FROM device_commands WHERE session_id = ? AND device_id = ? AND type = 'RESUME_SESSION' ORDER BY id DESC LIMIT 1`).get(active.session_id, active.device_id) as { id: number };
+    const revisionRow = db.prepare(`SELECT revision FROM session_devices WHERE id = ?`).get(active.session_device_id) as { revision: number };
+    db.prepare(`UPDATE session_devices SET last_command_id = ? WHERE id = ?`).run(resumeCommand.id, active.session_device_id);
+    appendSessionActionRequest(db, {
+      sessionId: active.session_id,
+      deviceId: active.device_id,
+      action: "resume",
+      idempotencyKey: options.idempotencyKey,
+      commandId: resumeCommand.id,
+      revision: revisionRow.revision,
     });
 
     appendSessionEvent(db, {
@@ -1578,11 +2004,15 @@ export function resumeSession(db: SqliteDatabase, sessionId: number, actor?: Per
 export function switchSessionApp(
   db: SqliteDatabase,
   sessionId: number,
-  input: { appPackage: string; appActivity?: string; actor?: PermissionActor | null },
+  input: { appPackage: string; appActivity?: string; actor?: PermissionActor | null } & SessionActionInput,
 ) {
   const active = resolveActiveSessionReference(db, sessionId, "session");
   if (!active) {
     throw new Error("Active session not found");
+  }
+  if (input.idempotencyKey) {
+    const existingAction = findExistingSessionAction(db, active.session_id, active.device_id, "switch", input.idempotencyKey);
+    if (existingAction) return getActiveSessionForDevice(db, active.device_id);
   }
   if (!["running", "paused"].includes(active.session_device_status)) {
     throw new Error("Switch App is only available for a running or paused session");
@@ -1609,14 +2039,25 @@ export function switchSessionApp(
   const currentAppName = resolveAppName(db, input.appPackage) ?? input.appPackage;
   const previousSummary = mapActiveSessionRow(active);
   const tx = db.transaction(() => {
-    db.prepare(`
+    const marked = db.prepare(`
       UPDATE session_devices
       SET current_app_package = ?,
           current_app_name = ?,
+          desired_app_package = ?,
+          desired_app_activity = ?,
+          operation_state = 'switch_pending',
+          revision = revision + 1,
           last_app_switch_at = CURRENT_TIMESTAMP,
           updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(input.appPackage, currentAppName, active.session_device_id);
+      WHERE id = ? AND status IN ('running', 'paused') AND operation_state = 'idle'
+    `).run(input.appPackage, currentAppName, input.appPackage, input.appActivity ?? null, active.session_device_id);
+    if (marked.changes !== 1) {
+      if (findExistingSessionAction(db, active.session_id, active.device_id, "switch", input.idempotencyKey)) {
+        return getActiveSessionForDevice(db, active.device_id);
+      }
+      throw new Error("Session action is already in progress");
+    }
+    db.prepare(`UPDATE sessions SET revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('running', 'paused', 'extended')`).run(active.session_id);
 
     const summary = getActiveSessionForDevice(db, active.device_id);
     createDeviceCommand(db, {
@@ -1633,6 +2074,17 @@ export function switchSessionApp(
         previous_session_state: previousSummary ? buildSessionStatePayload(previousSummary) : undefined,
         session_state: summary ? buildSessionStatePayload(summary) : undefined,
       },
+    });
+    const switchCommand = db.prepare(`SELECT id FROM device_commands WHERE session_id = ? AND device_id = ? AND type = 'SWITCH_SESSION_APP' ORDER BY id DESC LIMIT 1`).get(active.session_id, active.device_id) as { id: number };
+    const revisionRow = db.prepare(`SELECT revision FROM session_devices WHERE id = ?`).get(active.session_device_id) as { revision: number };
+    db.prepare(`UPDATE session_devices SET last_command_id = ? WHERE id = ?`).run(switchCommand.id, active.session_device_id);
+    appendSessionActionRequest(db, {
+      sessionId: active.session_id,
+      deviceId: active.device_id,
+      action: "switch",
+      idempotencyKey: input.idempotencyKey,
+      commandId: switchCommand.id,
+      revision: revisionRow.revision,
     });
 
     appendSessionEvent(db, {
@@ -1815,11 +2267,87 @@ function getCurrentSessionSeconds(db: SqliteDatabase, deviceId: number) {
 }
 
 export function listCommands(db: SqliteDatabase) {
-  return db.prepare(`SELECT * FROM device_commands ORDER BY created_at DESC, id DESC`).all();
+  const rows = db.prepare(`SELECT * FROM device_commands ORDER BY created_at DESC, id DESC`).all() as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    ...row,
+    operator_state: row.status === "timeout" && row.outcome_state === "unknown"
+      ? "result_unknown"
+      : row.status === "created" || row.status === "sent_to_hub"
+        ? "queued"
+        : row.status === "accepted_by_hub"
+          ? "sending_to_hub"
+          : row.status === "running"
+            ? "running"
+            : row.status,
+    retryable: getCommandPolicy(String(row.type)).retryable,
+    safe_to_retry: getCommandPolicy(String(row.type)).retryable && row.status !== "running",
+  }));
 }
 
 export function listSessions(db: SqliteDatabase) {
   return db.prepare(`SELECT * FROM sessions ORDER BY created_at DESC, id DESC`).all();
+}
+
+/**
+ * Cloud is the single owner of the auto-end decision. It only enqueues one
+ * END_SESSION command per device; physical cleanup and completion still need
+ * the normal command result/reconciliation path.
+ */
+export function reconcileExpiredSessions(db: SqliteDatabase, now = new Date()) {
+  const candidates = db.prepare(`
+    SELECT sd.id AS session_device_id, sd.device_id, sd.session_id
+    FROM session_devices sd
+    JOIN sessions s ON s.id = sd.session_id
+    WHERE sd.status IN ('running', 'paused')
+      AND sd.status != 'paused'
+      AND s.status IN ('running', 'extended')
+      AND sd.finished_at IS NULL
+  `).all() as Array<{ session_device_id: number; device_id: number; session_id: number }>;
+  const createdCommandIds: number[] = [];
+  for (const candidate of candidates) {
+    const active = getActiveSessionRowBySessionId(db, candidate.session_id);
+    if (!active || active.device_id !== candidate.device_id || computeRemainingSeconds(active, now) > 0) continue;
+    const tx = db.transaction(() => {
+      const claimed = db.prepare(`
+        UPDATE sessions
+        SET status = 'finishing', auto_end_requested_at = COALESCE(auto_end_requested_at, CURRENT_TIMESTAMP),
+            revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status IN ('running', 'extended') AND auto_end_requested_at IS NULL
+      `).run(candidate.session_id);
+      if (claimed.changes !== 1) return null;
+      const deviceUpdate = db.prepare(`
+        UPDATE session_devices
+        SET revision = revision + 1, operation_state = 'finish_pending', end_reason = 'expired', updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status IN ('running', 'paused') AND operation_state != 'finish_pending'
+      `).run(candidate.session_device_id);
+      if (deviceUpdate.changes !== 1) return null;
+      const commandId = createDeviceCommand(db, {
+        deviceId: candidate.device_id,
+        localHubId: active.local_hub_id ?? 0,
+        type: "END_SESSION",
+        sessionId: candidate.session_id,
+        payload: {
+          package: active.current_app_package ?? active.launch_package_name,
+          return_to_launcher: true,
+          auto_end: true,
+          session_state: buildSessionStatePayload({ ...mapActiveSessionRow(active)!, status: "ended" }),
+        },
+      });
+      db.prepare(`UPDATE session_devices SET last_command_id = ? WHERE id = ?`).run(commandId, candidate.session_device_id);
+      appendSessionEvent(db, {
+        sessionId: candidate.session_id,
+        sessionDeviceId: candidate.session_device_id,
+        deviceId: candidate.device_id,
+        type: "session_auto_end_requested",
+        message: `Session ${candidate.session_id} expired; cleanup was requested`,
+        payload: { command_id: commandId, remaining_seconds: 0 },
+      });
+      return commandId;
+    });
+    const commandId = tx();
+    if (commandId) createdCommandIds.push(commandId);
+  }
+  return createdCommandIds;
 }
 
 export function listAuditLogs(db: SqliteDatabase) {
@@ -1878,18 +2406,50 @@ export function updateCommandStatus(
   commandId: number,
   status: string,
   errorMessage?: string | null,
+  options: CommandStatusOptions = {},
 ) {
   const command = db.prepare(`
-    SELECT id, status, type, session_id, device_id, payload
+    SELECT id, status, type, session_id, device_id, local_hub_id, payload, payload_sha256,
+      claim_token, claimed_by, attempt, result_sha256, result_json, outcome_state
     FROM device_commands
     WHERE id = ?
   `).get(commandId) as
-    | { id: number; status: string; type: string; session_id: number | null; device_id: number; payload: string }
+    | { id: number; status: string; type: string; session_id: number | null; device_id: number; local_hub_id: number;
+        payload: string; payload_sha256?: string; claim_token?: string | null; claimed_by?: string | null; attempt: number;
+        result_sha256?: string | null; result_json?: string | null; outcome_state?: string }
     | undefined;
   if (!command) {
+    const tombstone = db.prepare(`SELECT command_id, status, result_sha256 FROM device_command_tombstones WHERE command_id = ?`).get(commandId) as { command_id: number; status: string; result_sha256: string | null } | undefined;
+    if (tombstone && tombstone.status === status) {
+      if (options.result && tombstone.result_sha256 && commandPayloadHash(options.result) !== tombstone.result_sha256) {
+        throw new Error(`Command ${commandId} terminal result conflict`);
+      }
+      return { id: commandId, status, idempotent: true, tombstoned: true };
+    }
     throw new Error("Command not found");
   }
-  if (!COMMAND_TRANSITIONS[command.status]?.includes(status)) {
+
+  if (options.hubId !== undefined && options.hubId !== null && command.local_hub_id !== options.hubId) {
+    throw new Error("Permission denied: command belongs to another Local Hub");
+  }
+  if (options.claimToken && command.claim_token && options.claimToken !== command.claim_token) {
+    throw new Error("Command claim token is stale or belongs to another Hub instance");
+  }
+
+  const isTerminal = ["succeeded", "failed", "timeout", "cancelled"].includes(command.status);
+  if (isTerminal && command.status === status) {
+    const nextResult = options.result ? JSON.stringify(options.result) : null;
+    const nextHash = options.result ? commandPayloadHash(options.result) : null;
+    if (nextHash && command.result_sha256 && nextHash !== command.result_sha256) {
+      throw new Error(`Command ${commandId} terminal result conflict`);
+    }
+    return { ...command, idempotent: true };
+  }
+  const reconciledUnknownOutcome = command.status === "timeout" && command.outcome_state === "unknown" && status === "succeeded" && options.reconciled === true;
+  if (options.outcomeState && !["pending", "known", "unknown", "reconciled"].includes(options.outcomeState)) {
+    throw new Error(`Invalid command outcome state: ${options.outcomeState}`);
+  }
+  if (!COMMAND_TRANSITIONS[command.status]?.includes(status) && !reconciledUnknownOutcome) {
     throw new Error(`Invalid command status transition: ${command.status} -> ${status}`);
   }
 
@@ -1902,30 +2462,75 @@ export function updateCommandStatus(
     cancelled: "finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP)",
   };
 
-  const transitionSql = transitions[status];
-  if (transitionSql) {
-    db.prepare(`
+  const resultJson = options.result ? JSON.stringify(options.result) : null;
+  const resultHash = options.result ? commandPayloadHash(options.result) : null;
+  const outcomeState = options.outcomeState ?? (status === "succeeded" || status === "failed" ? "known" : status === "timeout" ? "unknown" : "pending");
+  const transitionSql = transitions[status] ?? "";
+  const tx = db.transaction(() => {
+    const updated = db.prepare(`
       UPDATE device_commands
-      SET status = ?, error_message = ?, ${transitionSql}
-      WHERE id = ?
-    `).run(status, errorMessage ?? null, commandId);
-  } else {
+      SET status = ?, error_code = ?, error_message = ?, outcome_state = ?, result_json = COALESCE(?, result_json),
+          result_sha256 = COALESCE(?, result_sha256), last_transition_at = CURRENT_TIMESTAMP
+          ${transitionSql ? `, ${transitionSql}` : ""}
+      WHERE id = ? AND status = ?
+    `).run(status, options.errorCode ?? null, errorMessage ?? null, outcomeState, resultJson, resultHash, commandId, command.status);
+    if (updated.changes !== 1) {
+      throw new Error(`Command ${commandId} status changed concurrently; refusing last-write-wins update`);
+    }
     db.prepare(`
-      UPDATE device_commands
-      SET status = ?, error_message = ?
-      WHERE id = ?
-    `).run(status, errorMessage ?? null, commandId);
-  }
+      INSERT INTO device_command_events (
+        command_id, previous_status, new_status, hub_id, hub_instance_id, attempt, route, error_code, error_message, reconciled, result_delivery_attempt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(commandId, command.status, status, options.hubId ?? command.local_hub_id, options.hubInstanceId ?? command.claimed_by ?? null,
+      command.attempt ?? 0, options.route ?? null, options.errorCode ?? null, errorMessage ?? null, options.reconciled ? 1 : 0, options.resultDeliveryAttempt ?? null);
+    applyCommandLifecycleSideEffects(db, { ...command, outcome_state: outcomeState, result_sha256: resultHash }, status, errorMessage ?? null);
+  });
+  tx();
+  return { ...command, status, outcome_state: outcomeState, result_sha256: resultHash, idempotent: false };
+}
 
-  applyCommandLifecycleSideEffects(db, command, status, errorMessage ?? null);
+export function cancelDeviceCommand(db: SqliteDatabase, commandId: number, actor?: PermissionActor | null) {
+  const command = db.prepare(`
+    SELECT dc.id, dc.status, dc.device_id, dc.local_hub_id, c.organization_id, c.id AS club_id
+    FROM device_commands dc JOIN clubs c ON c.id = dc.club_id WHERE dc.id = ?
+  `).get(commandId) as { id: number; status: string; device_id: number; local_hub_id: number; organization_id: number; club_id: number } | undefined;
+  if (!command) throw new Error("Command not found");
+  assertActorCanAccessClub(actor, command.organization_id, command.club_id);
+  assertRole(actor, ["owner", "admin", "operator", "technician"], "cancel device command");
+  if (["succeeded", "failed", "timeout", "cancelled"].includes(command.status)) {
+    return { status: command.status, already_terminal: true };
+  }
+  if (command.status === "running") {
+    db.prepare(`UPDATE device_commands SET cancel_requested_at = COALESCE(cancel_requested_at, CURRENT_TIMESTAMP), last_transition_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'running'`).run(commandId);
+    db.prepare(`INSERT INTO device_command_events (command_id, previous_status, new_status, hub_id, error_code, error_message) VALUES (?, 'running', 'running', ?, 'COMMAND_CANCEL_REQUESTED', 'Cancellation requested; the physical operation may already be in progress')`).run(commandId, command.local_hub_id);
+    return { status: "running", cancel_requested: true };
+  }
+  updateCommandStatus(db, commandId, "cancelled", "Cancelled before execution", { errorCode: "COMMAND_CANCELLED" });
+  return { status: "cancelled", cancel_requested: false };
 }
 
 function applyCommandLifecycleSideEffects(
   db: SqliteDatabase,
-  command: { type: string; session_id: number | null; device_id: number; payload: string },
+  command: { id: number; type: string; session_id: number | null; device_id: number; payload: string; outcome_state?: string; result_sha256?: string | null },
   status: string,
   errorMessage: string | null,
 ) {
+  if (status === "timeout" && command.outcome_state === "unknown" && command.session_id) {
+    appendSessionEvent(db, {
+      sessionId: command.session_id,
+      deviceId: command.device_id,
+      type: "command_outcome_unknown",
+      severity: "critical",
+      message: errorMessage ?? "Local Hub lost the result; physical session state requires reconciliation",
+      payload: { command_status: status, outcome_state: command.outcome_state },
+    });
+    return;
+  }
+  if (status === "running" && command.type === "START_SESSION" && command.session_id) {
+    db.prepare(`UPDATE sessions SET status = 'starting', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('preparing', 'ready')`).run(command.session_id);
+    db.prepare(`INSERT INTO session_events (session_id, device_id, type, severity, message, payload) VALUES (?, ?, 'session_start_running', 'info', 'Local Hub started executing the session start command', ?)`)
+      .run(command.session_id, command.device_id, JSON.stringify({ command_id: command.id }));
+  }
   if (command.type === "FORGET_DEVICE" && status === "succeeded") {
     const device = db.prepare(`
       SELECT d.id, d.club_id, d.local_hub_id, c.organization_id
@@ -1936,7 +2541,9 @@ function applyCommandLifecycleSideEffects(
       | { id: number; club_id: number; local_hub_id: number | null; organization_id: number }
       | undefined;
 
-    if (device) {
+      if (device) {
+      db.prepare(`INSERT OR IGNORE INTO device_command_tombstones (command_id, type, status, result_sha256) VALUES (?, ?, 'succeeded', ?)`)
+        .run(command.id, command.type, command.result_sha256 ?? null);
       writeAuditLog(db, {
         action: "device.deleted",
         entityType: "device",
@@ -1965,11 +2572,11 @@ function applyCommandLifecycleSideEffects(
     ? payload.previous_session_state as Record<string, unknown>
     : null;
 
-  const restoreSessionState = (state: Record<string, unknown> | null | undefined) => {
+  const restoreSessionState = (state: Record<string, unknown> | null | undefined, expectedOperationState: string) => {
     if (!state || !command.session_id) {
       return;
     }
-    db.prepare(`
+    const restored = db.prepare(`
       UPDATE session_devices
       SET
         status = ?,
@@ -1979,8 +2586,12 @@ function applyCommandLifecycleSideEffects(
         current_app_package = ?,
         current_app_name = ?,
         last_app_switch_at = ?,
+        desired_app_package = NULL,
+        desired_app_activity = NULL,
+        operation_state = 'idle',
         updated_at = CURRENT_TIMESTAMP
       WHERE session_id = ? AND device_id = ?
+        AND operation_state = ?
     `).run(
       String(state.session_status) === "paused" ? "paused" : "running",
       state.paused ? (state.paused_at ? String(state.paused_at) : formatSqliteTimestamp(new Date())) : null,
@@ -1991,41 +2602,47 @@ function applyCommandLifecycleSideEffects(
       state.last_app_switch_at ? String(state.last_app_switch_at) : null,
       command.session_id,
       command.device_id,
+      expectedOperationState,
     );
+    if (restored.changes !== 1) return;
     db.prepare(`
       UPDATE sessions
-      SET status = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
+      SET status = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'failed', 'finishing')
     `).run(String(state.session_status) === "paused" ? "paused" : "running", command.session_id);
   };
 
   if (command.type === "START_SESSION") {
     if (status === "succeeded") {
-      const session = db.prepare(`SELECT duration_minutes FROM sessions WHERE id = ?`).get(command.session_id) as
-        | { duration_minutes: number }
+      const session = db.prepare(`SELECT duration_minutes, extension_minutes FROM sessions WHERE id = ?`).get(command.session_id) as
+        | { duration_minutes: number; extension_minutes: number }
         | undefined;
-      db.prepare(`
+      const updatedDevice = db.prepare(`
         UPDATE session_devices
         SET status = 'running',
             started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
             current_app_package = ?,
             current_app_name = COALESCE(?, current_app_name),
+            desired_app_package = NULL,
+            desired_app_activity = NULL,
+            operation_state = 'idle',
             updated_at = CURRENT_TIMESTAMP
-        WHERE session_id = ? AND device_id = ?
+        WHERE session_id = ? AND device_id = ? AND operation_state = 'start_pending'
       `).run(
         String(payload.package ?? QUEST_AGENT_PACKAGE),
         payload.app_name ? String(payload.app_name) : null,
         command.session_id,
         command.device_id,
       );
+      if (updatedDevice.changes !== 1) return;
       db.prepare(`
         UPDATE sessions
-        SET status = 'running',
-            started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
-            ends_at = COALESCE(ends_at, datetime(CURRENT_TIMESTAMP, '+' || ? || ' minutes')),
+        SET started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+            ends_at = COALESCE(ends_at, datetime(CURRENT_TIMESTAMP, '+' || (? + ?) || ' minutes')),
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(session?.duration_minutes ?? 0, command.session_id);
+        WHERE id = ? AND status IN ('preparing', 'ready', 'starting', 'running')
+      `).run(session?.duration_minutes ?? 0, session?.extension_minutes ?? 0, command.session_id);
+      refreshSessionAggregate(db, command.session_id);
       db.prepare(`
         UPDATE devices
         SET status = 'in_session', current_app_package = ?, updated_at = CURRENT_TIMESTAMP
@@ -2043,19 +2660,15 @@ function applyCommandLifecycleSideEffects(
 
     db.prepare(`
       UPDATE session_devices
-      SET status = 'failed', end_reason = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE session_id = ? AND device_id = ?
+      SET status = 'failed', operation_state = 'idle', end_reason = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE session_id = ? AND device_id = ? AND operation_state = 'start_pending'
     `).run(errorMessage ?? status, command.session_id, command.device_id);
     db.prepare(`
       UPDATE devices
       SET status = 'error', updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(command.device_id);
-    db.prepare(`
-      UPDATE sessions
-      SET status = 'failed', finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(command.session_id);
+    refreshSessionAggregate(db, command.session_id);
     appendSessionEvent(db, {
       sessionId: command.session_id,
       deviceId: command.device_id,
@@ -2068,6 +2681,7 @@ function applyCommandLifecycleSideEffects(
 
   if (command.type === "PAUSE_SESSION") {
     if (status === "succeeded") {
+      db.prepare(`UPDATE session_devices SET operation_state = 'idle', updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND device_id = ? AND operation_state = 'pause_pending'`).run(command.session_id, command.device_id);
       db.prepare(`
         UPDATE devices
         SET status = 'in_session', current_app_package = ?, updated_at = CURRENT_TIMESTAMP
@@ -2083,7 +2697,7 @@ function applyCommandLifecycleSideEffects(
       return;
     }
 
-    restoreSessionState(previousSessionState);
+    restoreSessionState(previousSessionState, "pause_pending");
     appendSessionEvent(db, {
       sessionId: command.session_id,
       deviceId: command.device_id,
@@ -2097,6 +2711,7 @@ function applyCommandLifecycleSideEffects(
 
   if (command.type === "RESUME_SESSION") {
     if (status === "succeeded") {
+      db.prepare(`UPDATE session_devices SET operation_state = 'idle', updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND device_id = ? AND operation_state = 'resume_pending'`).run(command.session_id, command.device_id);
       db.prepare(`
         UPDATE devices
         SET status = 'in_session', current_app_package = ?, updated_at = CURRENT_TIMESTAMP
@@ -2112,7 +2727,7 @@ function applyCommandLifecycleSideEffects(
       return;
     }
 
-    restoreSessionState(previousSessionState);
+    restoreSessionState(previousSessionState, "resume_pending");
     appendSessionEvent(db, {
       sessionId: command.session_id,
       deviceId: command.device_id,
@@ -2124,8 +2739,38 @@ function applyCommandLifecycleSideEffects(
     return;
   }
 
+  if (command.type === "EXTEND_SESSION") {
+    if (status === "succeeded") {
+      db.prepare(`UPDATE session_devices SET operation_state = 'idle', updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND device_id = ? AND operation_state = 'extend_pending'`).run(command.session_id, command.device_id);
+      appendSessionEvent(db, {
+        sessionId: command.session_id,
+        deviceId: command.device_id,
+        type: "session_extension_confirmed",
+        message: `Local Hub confirmed session extension for device ${command.device_id}`,
+        payload: { command_status: status },
+      });
+      return;
+    }
+    db.prepare(`UPDATE session_devices SET operation_state = 'reconciliation_required', updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND device_id = ? AND operation_state = 'extend_pending'`).run(command.session_id, command.device_id);
+    db.prepare(`UPDATE sessions SET recovery_state = 'reconciliation_required', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status NOT IN ('completed', 'cancelled')`).run(command.session_id);
+    appendSessionEvent(db, {
+      sessionId: command.session_id,
+      deviceId: command.device_id,
+      type: "session_extension_failed",
+      severity: "warning",
+      message: errorMessage ?? `Local Hub reported ${status} while extending session`,
+      payload: { command_status: status },
+    });
+    return;
+  }
+
   if (command.type === "SWITCH_SESSION_APP") {
     if (status === "succeeded") {
+      db.prepare(`
+        UPDATE session_devices
+        SET desired_app_package = NULL, desired_app_activity = NULL, operation_state = 'idle', updated_at = CURRENT_TIMESTAMP
+        WHERE session_id = ? AND device_id = ? AND operation_state = 'switch_pending'
+      `).run(command.session_id, command.device_id);
       db.prepare(`
         UPDATE devices
         SET status = 'in_session',
@@ -2148,7 +2793,7 @@ function applyCommandLifecycleSideEffects(
       return;
     }
 
-    restoreSessionState(previousSessionState);
+    restoreSessionState(previousSessionState, "switch_pending");
     appendSessionEvent(db, {
       sessionId: command.session_id,
       deviceId: command.device_id,
@@ -2163,9 +2808,10 @@ function applyCommandLifecycleSideEffects(
   if (command.type === "END_SESSION") {
     if (status === "succeeded") {
       db.prepare(`
-        UPDATE session_devices
-        SET status = 'finished', finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-        WHERE session_id = ? AND device_id = ?
+      UPDATE session_devices
+        SET status = 'finished', operation_state = 'idle', desired_app_package = NULL, desired_app_activity = NULL,
+            finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE session_id = ? AND device_id = ? AND operation_state = 'finish_pending'
       `).run(command.session_id, command.device_id);
       db.prepare(`
         UPDATE devices
@@ -2191,23 +2837,25 @@ function applyCommandLifecycleSideEffects(
       if (remaining.count === 0) {
         db.prepare(`
           UPDATE sessions
-          SET status = 'completed', finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-          WHERE id = ?
+          SET status = 'completed', recovery_state = 'none', finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP), revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND status = 'finishing'
         `).run(command.session_id);
       }
       return;
     }
 
-    db.prepare(`
+    const failedDevice = db.prepare(`
       UPDATE session_devices
       SET status = 'failed', end_reason = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE session_id = ? AND device_id = ?
+      WHERE session_id = ? AND device_id = ? AND operation_state = 'finish_pending'
     `).run(errorMessage ?? status, command.session_id, command.device_id);
+    if (failedDevice.changes !== 1) return;
     db.prepare(`
       UPDATE devices SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?
     `).run(command.device_id);
     db.prepare(`
-      UPDATE sessions SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?
+      UPDATE sessions SET status = 'failed', revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status = 'finishing'
     `).run(command.session_id);
     appendSessionEvent(db, {
       sessionId: command.session_id,
@@ -2220,18 +2868,45 @@ function applyCommandLifecycleSideEffects(
   }
 }
 
-export function syncHubState(db: SqliteDatabase, hubId: number, payload: SyncPayload) {
-  db.prepare(`
-    UPDATE local_hubs
-    SET
-      host = COALESCE(?, host),
-      last_heartbeat_at = CURRENT_TIMESTAMP,
-      last_sync_at = CURRENT_TIMESTAMP,
-      status = 'online',
-      updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(payload.hub_host ?? null, hubId);
+function reconcileSessionFromHeartbeat(db: SqliteDatabase, deviceId: number, heartbeat: NonNullable<SyncPayload["agent_heartbeats"]>[number]) {
+  if (heartbeat.session_id === undefined || heartbeat.session_id === null) return false;
+  const active = getActiveSessionRowForDevice(db, deviceId);
+  if (!active || active.session_id !== Number(heartbeat.session_id)) return false;
+  const timestamp = Number(heartbeat.timestamp ?? 0);
+  if (timestamp > 0 && active.last_agent_timestamp_ms !== null && timestamp <= active.last_agent_timestamp_ms) return false;
+  const heartbeatRevision = heartbeat.session_revision === undefined ? null : Number(heartbeat.session_revision);
+  if (heartbeatRevision !== null && heartbeatRevision < Number(active.device_revision ?? 0)) return false;
+  db.prepare(`UPDATE session_devices SET last_agent_heartbeat_at = CURRENT_TIMESTAMP, last_agent_timestamp_ms = ?, agent_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(timestamp || null, active.session_id, active.session_device_id);
 
+  const expectedPackage = active.desired_app_package ?? active.current_app_package ?? active.launch_package_name;
+  const packageMatches = !heartbeat.current_app_package || heartbeat.current_app_package === expectedPackage;
+  if (heartbeat.session_status === "running" && heartbeat.in_session && packageMatches && ["starting", "running", "extended"].includes(active.session_status)) {
+    const changed = db.prepare(`
+      UPDATE session_devices
+      SET status = 'running', started_at = COALESCE(started_at, CURRENT_TIMESTAMP), operation_state = 'idle',
+          current_app_package = COALESCE(?, current_app_package), current_app_name = COALESCE(?, current_app_name), updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status IN ('preparing', 'ready', 'running', 'paused')
+        AND operation_state != 'finish_pending'
+    `).run(heartbeat.current_app_package ?? null, heartbeat.current_app_name ?? null, active.session_device_id);
+    if (changed.changes === 1 && ["starting", "preparing", "ready"].includes(active.session_status)) {
+      db.prepare(`UPDATE sessions SET status = 'running', started_at = COALESCE(started_at, CURRENT_TIMESTAMP), ends_at = COALESCE(ends_at, datetime(CURRENT_TIMESTAMP, '+' || (SELECT duration_minutes + extension_minutes FROM sessions WHERE id = ?) || ' minutes')), recovery_state = 'none', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('starting', 'preparing', 'ready')`).run(active.session_id, active.session_id);
+      appendSessionEvent(db, { sessionId: active.session_id, deviceId, type: "session_reconciled_running", message: `Heartbeat reconciled session ${active.session_id} as running`, payload: { revision: heartbeatRevision, current_app_package: heartbeat.current_app_package ?? null } });
+    }
+  } else if (heartbeat.session_status === "paused" && heartbeat.in_session && packageMatches && ["running", "extended", "paused"].includes(active.session_status)) {
+    const changed = db.prepare(`
+      UPDATE session_devices
+      SET status = 'paused', paused_at = COALESCE(paused_at, CURRENT_TIMESTAMP), paused_remaining_seconds = ?, operation_state = 'idle', updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status = 'running' AND operation_state != 'finish_pending'
+    `).run(Math.max(0, Number(heartbeat.remaining_seconds ?? 0)), active.session_device_id);
+    if (changed.changes === 1 && active.session_status !== "paused") {
+      db.prepare(`UPDATE sessions SET status = 'paused', recovery_state = 'none', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('running', 'extended')`).run(active.session_id);
+      appendSessionEvent(db, { sessionId: active.session_id, deviceId, type: "session_reconciled_paused", message: `Heartbeat reconciled session ${active.session_id} as paused`, payload: { remaining_seconds: heartbeat.remaining_seconds ?? null } });
+    }
+  }
+  return heartbeat.in_session === true && active.session_status !== "finishing" && packageMatches;
+}
+
+export function syncHubState(db: SqliteDatabase, hubId: number, payload: SyncPayload) {
   const hub = db.prepare(`
     SELECT h.id, h.club_id, c.organization_id
     FROM local_hubs h
@@ -2242,6 +2917,17 @@ export function syncHubState(db: SqliteDatabase, hubId: number, payload: SyncPay
   if (!hub) {
     throw new Error("Local Hub not found");
   }
+
+  db.prepare(`
+    UPDATE local_hubs
+    SET
+      host = COALESCE(?, host),
+      last_heartbeat_at = CURRENT_TIMESTAMP,
+      last_sync_at = CURRENT_TIMESTAMP,
+      status = 'online',
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(payload.hub_host ?? null, hubId);
 
   const detailsArray: DeviceDetail[] =
     payload.device_details ?? payload.active_serials?.map((serial) => ({ serial })) ?? [];
@@ -2402,6 +3088,7 @@ export function syncHubState(db: SqliteDatabase, hubId: number, payload: SyncPay
 
       const row = db.prepare(`SELECT adb_status, previous_ips, android_id FROM devices WHERE id = ?`).get(device.id) as { adb_status: string; previous_ips: string | null; android_id: string | null };
       const connectionStatus = row.adb_status === "online" ? "online" : "agent_online_adb_offline";
+      const sessionRealityMatches = reconcileSessionFromHeartbeat(db, device.id, heartbeat);
       const heartbeatAndroidId =
         heartbeat.android_id && row.android_id && row.android_id !== heartbeat.android_id
           ? row.android_id
@@ -2429,7 +3116,7 @@ export function syncHubState(db: SqliteDatabase, hubId: number, payload: SyncPay
           last_heartbeat_at = CURRENT_TIMESTAMP,
           last_seen_at = CURRENT_TIMESTAMP,
           status = CASE
-            WHEN ? = 1 THEN 'in_session'
+            WHEN ? = 1 AND ? = 1 THEN 'in_session'
             WHEN status IN ('new', 'pairing_required') AND ? = 'online' THEN 'online'
             ELSE status
           END,
@@ -2450,6 +3137,7 @@ export function syncHubState(db: SqliteDatabase, hubId: number, payload: SyncPay
         heartbeat.charging_state ? Number(String(heartbeat.charging_state).toLowerCase() === "charging") : null,
         connectionStatus,
         heartbeat.in_session ? 1 : 0,
+        sessionRealityMatches ? 1 : 0,
         connectionStatus,
         device.id,
       );
@@ -2462,24 +3150,72 @@ export function syncHubState(db: SqliteDatabase, hubId: number, payload: SyncPay
   });
   tx();
 
-  const pendingCommands = db.prepare(`
-    SELECT dc.*, COALESCE(d.stable_id, d.serial_number) AS device_serial_number
-    FROM device_commands dc
-    JOIN devices d ON d.id = dc.device_id
-    WHERE dc.local_hub_id = ? AND dc.status IN ('created', 'sent_to_hub')
-    ORDER BY dc.created_at ASC, dc.id ASC
-  `).all(hubId) as Array<Record<string, unknown>>;
+  const instanceId = String(payload.hub_instance_id || `hub-${hubId}`);
+  const leaseSeconds = 45;
+  const pendingCommands: Array<Record<string, unknown>> = [];
+  const claimTx = db.transaction(() => {
+    const candidates = db.prepare(`
+      SELECT dc.*, COALESCE(d.stable_id, d.serial_number) AS device_serial_number
+      FROM device_commands dc
+      JOIN devices d ON d.id = dc.device_id
+      WHERE dc.local_hub_id = ?
+        AND (
+          dc.status IN ('created', 'sent_to_hub')
+          OR (dc.status IN ('accepted_by_hub', 'running') AND dc.claimed_by = ? AND dc.lease_until > CURRENT_TIMESTAMP)
+          OR (dc.status IN ('accepted_by_hub', 'running') AND dc.lease_until IS NOT NULL AND dc.lease_until <= CURRENT_TIMESTAMP)
+          OR (dc.status = 'timeout' AND dc.outcome_state = 'unknown')
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM device_commands earlier
+          WHERE earlier.device_id = dc.device_id
+            AND (earlier.created_at < dc.created_at OR (earlier.created_at = dc.created_at AND earlier.id < dc.id))
+            AND (earlier.status NOT IN ('succeeded', 'failed', 'timeout', 'cancelled')
+              OR (earlier.status = 'timeout' AND earlier.outcome_state = 'unknown'))
+        )
+      ORDER BY dc.created_at ASC, dc.id ASC
+    `).all(hubId, instanceId) as Array<Record<string, unknown>>;
 
-  if (pendingCommands.length > 0) {
-    const ids = pendingCommands.map((command) => Number(command.id));
-    const placeholders = ids.map(() => "?").join(", ");
-    db.prepare(`
-      UPDATE device_commands
-      SET status = 'accepted_by_hub', accepted_at = COALESCE(accepted_at, CURRENT_TIMESTAMP)
-      WHERE id IN (${placeholders})
-    `).run(...ids);
-  }
-
+    for (const candidate of candidates) {
+      const currentStatus = String(candidate.status);
+      const activeOwnedByThisInstance = (currentStatus === "accepted_by_hub" || currentStatus === "running")
+        && String(candidate.claimed_by || "") === instanceId
+        && String(candidate.lease_until || "") > formatSqliteTimestamp(new Date()).slice(0, 19);
+      const recovery = (currentStatus === "accepted_by_hub" || currentStatus === "running" || (currentStatus === "timeout" && candidate.outcome_state === "unknown")) && !activeOwnedByThisInstance;
+      const claimToken = crypto.randomUUID();
+      if (!recovery && (currentStatus === "created" || currentStatus === "sent_to_hub") && Number(candidate.attempt || 0) >= Number(candidate.max_attempts || getCommandPolicy(String(candidate.type)).maxAttempts)) {
+        db.prepare(`UPDATE device_commands SET status = 'failed', error_code = 'COMMAND_RETRY_EXHAUSTED', error_message = 'Command delivery attempt budget exhausted', outcome_state = 'known', finished_at = CURRENT_TIMESTAMP, last_transition_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?`)
+          .run(Number(candidate.id), currentStatus);
+        db.prepare(`INSERT INTO device_command_events (command_id, previous_status, new_status, hub_id, hub_instance_id, attempt, error_code, error_message) VALUES (?, ?, 'failed', ?, ?, ?, 'COMMAND_RETRY_EXHAUSTED', 'Command delivery attempt budget exhausted')`)
+          .run(Number(candidate.id), currentStatus, hubId, instanceId, Number(candidate.attempt || 0));
+        continue;
+      }
+      const updated = db.prepare(`
+        UPDATE device_commands
+        SET status = CASE WHEN status IN ('created', 'sent_to_hub') THEN 'accepted_by_hub' ELSE status END,
+            accepted_at = COALESCE(accepted_at, CURRENT_TIMESTAMP), claimed_by = ?,
+            claim_token = CASE WHEN status IN ('created', 'sent_to_hub') OR lease_until <= CURRENT_TIMESTAMP OR (status = 'timeout' AND outcome_state = 'unknown') THEN ? ELSE claim_token END,
+            lease_until = datetime('now', '+' || ? || ' seconds'), attempt = attempt + CASE WHEN status IN ('created', 'sent_to_hub') OR lease_until <= CURRENT_TIMESTAMP OR (status = 'timeout' AND outcome_state = 'unknown') THEN 1 ELSE 0 END,
+            last_transition_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND local_hub_id = ?
+          AND (
+            status IN ('created', 'sent_to_hub')
+            OR (status IN ('accepted_by_hub', 'running') AND ((claimed_by = ? AND lease_until > CURRENT_TIMESTAMP) OR lease_until <= CURRENT_TIMESTAMP))
+            OR (status = 'timeout' AND outcome_state = 'unknown')
+          )
+      `).run(instanceId, claimToken, leaseSeconds, Number(candidate.id), hubId, instanceId);
+      if (updated.changes !== 1) continue;
+      if (!recovery && currentStatus !== "accepted_by_hub") {
+        db.prepare(`INSERT INTO device_command_events (command_id, previous_status, new_status, hub_id, hub_instance_id, attempt) VALUES (?, ?, 'accepted_by_hub', ?, ?, ?)`)
+          .run(Number(candidate.id), currentStatus, hubId, instanceId, Number(candidate.attempt || 0));
+      } else if (recovery) {
+        db.prepare(`INSERT INTO device_command_events (command_id, previous_status, new_status, hub_id, hub_instance_id, attempt, error_code, error_message) VALUES (?, ?, ?, ?, ?, ?, 'COMMAND_LEASE_RECLAIMED', 'Lease expired; Local Hub must reconcile before executing')`)
+          .run(Number(candidate.id), currentStatus, currentStatus, hubId, instanceId, Number(candidate.attempt || 0));
+      }
+      const claimed = db.prepare(`SELECT dc.*, COALESCE(d.stable_id, d.serial_number) AS device_serial_number FROM device_commands dc JOIN devices d ON d.id = dc.device_id WHERE dc.id = ?`).get(Number(candidate.id)) as Record<string, unknown>;
+      pendingCommands.push({ ...claimed, recovery_required: recovery, hub_instance_id: instanceId });
+    }
+  });
+  claimTx();
   return pendingCommands;
 }
 

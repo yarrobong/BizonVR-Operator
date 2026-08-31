@@ -39,6 +39,30 @@ scrcpy -b 25M --max-size=1600 --crop=1600:1000:116:460 --no-audio
 - Command chain: Web -> Cloud API -> DeviceCommand DB -> Local Hub Sync.
 - No direct cloud-to-device ADB.
 - Safe process runners for ADB commands.
+- ADB recovery is single-flight per Quest with bounded backoff, identity verification, stale-route protection, and timeout-bounded async process execution. See [ADB reliability](docs/adb-reliability.md).
+- Casting uses one managed producer per stable Quest, viewer fan-out, bounded backpressure, generation-safe recovery, SIGTERM/SIGKILL cleanup, and configurable resource limits. See [Cast reliability](docs/cast-reliability.md).
+- Session Engine uses Cloud-owned durable timestamps, strict transitions, one active session per Quest, revision/idempotency guards, foreground launch verification, heartbeat reconciliation, and confirmed cleanup. See [Session reliability](docs/session-reliability.md).
+
+## Real hardware ADB validation
+
+Run the non-production soak harness against a real Quest using its stable identity:
+
+```bash
+node scripts/adb-hardware-soak.js --device '<stable-id>' --duration 30m --interval 5s --api-url http://localhost:3000 --verbose
+```
+
+It writes JSON and human-readable artifacts under `artifacts/adb-soak/`. The
+full physical scenario checklist is in [ADB hardware test plan](docs/adb-hardware-test-plan.md).
+If no Quest is connected, the harness records `NOT RUN`; fake ADB tests never
+count as hardware evidence.
+
+For the full session path, configure `SESSION_HARDWARE_API_URL`,
+`SESSION_HARDWARE_DEVICE_ID` and `SESSION_HARDWARE_APP_PACKAGE`, then run
+`node scripts/session-hardware-soak.js`. It uses the public API pipeline and
+does not claim PASS without physical verification. The complete acceptance
+sequence is in [Session hardware test plan](docs/session-hardware-test-plan.md).
+
+For real-device casting validation, use `node scripts/cast-hardware-soak.js --device '<adb-route>' --api-url http://<hub-lan-ip>:3001 --duration 30m --interval 5s --profile low-latency`. It records first-frame latency, stream failures, bytes, and ADB availability; absent hardware is reported as `NOT RUN`.
 
 ## Quest connection stability model
 

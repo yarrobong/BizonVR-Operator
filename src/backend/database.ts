@@ -241,6 +241,56 @@ function redactSecrets(value: unknown): unknown {
   }));
 }
 
+function assertNoRawCredentialFields(value: unknown, location = "payload") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoRawCredentialFields(item, `${location}[${index}]`));
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (key === "rotate_agent_credential" && item === true) continue;
+    if (/(?:agent[_-]?token|token)[_-]?hash$/i.test(key)) {
+      if (typeof item === "string" && /^[a-f0-9]{64}$/i.test(item)) continue;
+      throw new Error(`Agent credential hash must be valid SHA-256 in ${location}: ${key}`);
+    }
+    if (/(?:token|credential|secret|password|private[_-]?key)$/i.test(key)) {
+      throw new Error(`Raw credential field is not accepted in ${location}: ${key}`);
+    }
+    assertNoRawCredentialFields(item, `${location}.${key}`);
+  }
+}
+
+function redactLegacyRawCredentialFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactLegacyRawCredentialFields);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => {
+    if (/(?:token|credential|secret|password|private[_-]?key)$/i.test(key)) {
+      return [key, "[REDACTED]"];
+    }
+    return [key, redactLegacyRawCredentialFields(item)];
+  }));
+}
+
+function scrubLegacyAgentCredentials(db: SqliteDatabase) {
+  const scrubJsonColumn = (table: "device_commands" | "audit_logs" | "session_events", column: "payload" | "result_json" | "details") => {
+    const tableExists = Boolean(db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table));
+    if (!tableExists) return;
+    const rows = db.prepare(`SELECT rowid AS row_id, ${column} FROM ${table} WHERE ${column} IS NOT NULL`).all() as Array<{ row_id: number; [key: string]: unknown }>;
+    const update = db.prepare(`UPDATE ${table} SET ${column} = ? WHERE rowid = ?`);
+    for (const row of rows) {
+      const original = String(row[column]);
+      const parsed = parseJsonObject(original);
+      const redacted = JSON.stringify(redactLegacyRawCredentialFields(parsed));
+      if (redacted !== original) update.run(redacted, row.row_id);
+    }
+  };
+
+  scrubJsonColumn("device_commands", "payload");
+  scrubJsonColumn("device_commands", "result_json");
+  scrubJsonColumn("audit_logs", "details");
+  scrubJsonColumn("session_events", "payload");
+}
+
 function dedupeIps(...groups: Array<Array<string | null | undefined> | undefined>) {
   const ordered: string[] = [];
   for (const group of groups) {
@@ -623,6 +673,7 @@ export function applyMigrations(db: SqliteDatabase, migrationsDir = path.join(pr
         || (migrationFile === "0005_device_command_reliability.sql" && !hasTable("device_commands"))
         || (migrationFile === "0006_session_reliability.sql" && (!hasTable("sessions") || !hasTable("session_devices")));
       if (!alreadyCompatible && !isPartialLegacySnapshot) db.exec(readMigration(migrationFile, migrationsDir));
+      if (migrationFile === "0008_scrub_agent_credentials.sql") scrubLegacyAgentCredentials(db);
       ensureSchemaCompatibility(db, migrationFile);
       db.prepare(`INSERT INTO schema_migrations (version) VALUES (?)`).run(migrationFile);
     });
@@ -683,18 +734,6 @@ export function writeAuditLog(
     String(params.entityId),
     JSON.stringify(redactSecrets(params.details ?? {})),
   );
-}
-
-export function provisionAgentCredential(db: SqliteDatabase, deviceId: number) {
-  const token = crypto.randomBytes(32).toString("base64url");
-  const hash = crypto.createHash("sha256").update(token).digest("hex");
-  const updated = db.prepare(`
-    UPDATE devices
-    SET agent_token_hash = ?, agent_token_issued_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(hash, deviceId);
-  if (updated.changes !== 1) throw new Error("Device not found");
-  return token;
 }
 
 export function verifyAgentCredential(
@@ -1052,6 +1091,7 @@ export function createDeviceCommand(db: SqliteDatabase, input: CreateCommandInpu
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Command payload must be a JSON object");
   }
+  assertNoRawCredentialFields(payload);
   for (const key of ["package", "package_name", "app_package", "current_app_package"]) {
     const candidate = payload[key];
     if (candidate !== undefined && (typeof candidate !== "string" || !isValidPackageName(candidate))) {
@@ -1147,7 +1187,7 @@ export function appendSessionEvent(
     input.type,
     input.severity ?? "info",
     input.message,
-    JSON.stringify(input.payload ?? {}),
+    JSON.stringify(redactSecrets(input.payload ?? {})),
   );
 }
 
@@ -2490,6 +2530,28 @@ export function markOperatorCall(db: SqliteDatabase, pairingId: string, localHub
   `).run(...(localHubId ? [pairingId, localHubId] : [pairingId]));
 }
 
+function applyAgentProvisioningResult(
+  db: SqliteDatabase,
+  command: { type: string; device_id: number; payload: string },
+  status: string,
+  result: Record<string, unknown> | null,
+) {
+  if (status !== "succeeded") return;
+  const payload = parseJsonObject(command.payload);
+  if (command.type !== "INSTALL_APK" || payload.target !== "quest_agent" || payload.rotate_agent_credential !== true) return;
+
+  const agentTokenHash = result?.agent_token_hash;
+  if (typeof agentTokenHash !== "string" || !/^[a-f0-9]{64}$/i.test(agentTokenHash)) {
+    throw new Error("Quest Agent provisioning requires a valid SHA-256 agent_token_hash result");
+  }
+  const updated = db.prepare(`
+    UPDATE devices
+    SET agent_token_hash = ?, agent_token_issued_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(agentTokenHash.toLowerCase(), command.device_id);
+  if (updated.changes !== 1) throw new Error("Quest Agent provisioning target device was not found");
+}
+
 export function updateCommandStatus(
   db: SqliteDatabase,
   commandId: number,
@@ -2497,6 +2559,9 @@ export function updateCommandStatus(
   errorMessage?: string | null,
   options: CommandStatusOptions = {},
 ) {
+  if (options.result !== undefined && options.result !== null) {
+    assertNoRawCredentialFields(options.result, "result");
+  }
   const command = db.prepare(`
     SELECT id, status, type, session_id, device_id, local_hub_id, payload, payload_sha256,
       claim_token, claimed_by, attempt, result_sha256, result_json, outcome_state
@@ -2572,6 +2637,7 @@ export function updateCommandStatus(
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(commandId, command.status, status, options.hubId ?? command.local_hub_id, options.hubInstanceId ?? command.claimed_by ?? null,
       command.attempt ?? 0, options.route ?? null, options.errorCode ?? null, errorMessage ?? null, options.reconciled ? 1 : 0, options.resultDeliveryAttempt ?? null);
+    applyAgentProvisioningResult(db, command, status, options.result ?? null);
     applyCommandLifecycleSideEffects(db, { ...command, outcome_state: outcomeState, result_sha256: resultHash }, status, errorMessage ?? null);
   });
   tx();

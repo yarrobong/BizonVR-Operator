@@ -60,6 +60,18 @@ describe("Web API authentication boundary", () => {
     assert.equal(result.response.status, 200);
   });
 
+  it("stores Agent provisioning intent without a raw credential", async () => {
+    const response = await fetch(`${baseUrl}/api/devices/1/install_agent`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${createWebAuthToken(1)}` },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { command_id: number };
+    const row = db.prepare(`SELECT payload FROM device_commands WHERE id = ?`).get(body.command_id) as { payload: string };
+    assert.match(row.payload, /"rotate_agent_credential":true/);
+    assert.doesNotMatch(row.payload, /agent_token/);
+  });
+
   it("returns 413 for an oversized JSON control request", async () => {
     const response = await fetch(`${baseUrl}/api/commands`, {
       method: "POST",

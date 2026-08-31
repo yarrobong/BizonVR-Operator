@@ -12,9 +12,12 @@ comparisons are constant-time and Hub IDs are checked against the credential
 being used. A missing Hub token is rejected unless the explicitly named
 `ALLOW_DEV_HUB_AUTH_FALLBACK=1` is enabled outside production.
 
-Quest Agent requests use a pairing-bound credential provisioned by the pair or
-install command. It is passed in the HTTP Authorization header, stored as a
-hash in Cloud, and never returned by inventory, command, or audit list APIs.
+Quest Agent provisioning is a non-secret Cloud command intent. The Local Hub
+generates the pairing-bound credential locally, provisions the raw credential
+to the Quest, and keeps the raw value only in its mode-0600 local credential
+cache. The Hub reports only the SHA-256 hash to Cloud, which stores that hash
+on the device. The credential is passed in the HTTP Authorization header and
+is never returned by inventory, command, or audit list APIs.
 The Local Hub also requires a fresh Agent timestamp (default one minute) and
 rejects non-monotonic heartbeat timestamps. This limits stale heartbeat replay;
 full signed nonce protocol and an independent revocation list are intentionally

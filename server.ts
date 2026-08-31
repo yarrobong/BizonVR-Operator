@@ -30,7 +30,6 @@ import {
   switchSessionApp,
   syncHubState,
   updateCommandStatus,
-  provisionAgentCredential,
 } from "./src/backend/database";
 import { buildCastResponse as buildCastResponsePayload } from "./src/backend/cast";
 import { constantTimeEqualSecret, verifyWebAuthToken } from "./src/backend/auth";
@@ -339,7 +338,6 @@ app.post("/api/devices/:id/pair", (req, res) => {
     `).run(requestedName || null, deviceId);
 
     const appVersion = getLatestAppVersionForPackage(db, QUEST_AGENT_PACKAGE);
-    const agentToken = provisionAgentCredential(db, deviceId);
     const commandIds: number[] = [];
     if (appVersion?.apk_checksum) {
       commandIds.push(createDeviceCommand(db, {
@@ -357,7 +355,7 @@ app.post("/api/devices/:id/pair", (req, res) => {
           apk_checksum: appVersion.apk_checksum,
           download_url: appVersion.download_url,
           pairing_id: device.pairing_id || null,
-          agent_token: agentToken,
+          rotate_agent_credential: true,
         },
       }));
     }
@@ -494,7 +492,6 @@ app.post("/api/devices/:id/install_agent", (req, res) => {
   }
 
   try {
-    const agentToken = provisionAgentCredential(db, deviceId);
     const commandId = createDeviceCommand(db, {
       localHubId: Number(device.local_hub_id),
       deviceId,
@@ -510,7 +507,7 @@ app.post("/api/devices/:id/install_agent", (req, res) => {
         apk_checksum: appVersion.apk_checksum,
         download_url: appVersion.download_url,
         pairing_id: device.pairing_id || null,
-        agent_token: agentToken,
+        rotate_agent_credential: true,
       },
     });
 

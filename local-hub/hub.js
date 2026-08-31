@@ -24,6 +24,7 @@ import {
 } from './streaming.js';
 import { DEFAULT_CAST_PROFILE, DEFAULT_CAST_TRANSPORT } from '../src/shared/cast-config.js';
 import { resolveApprovedApk } from './apk-security.js';
+import { buildAgentCredentialRecord, buildAgentProvisioningResult, createAgentCredential, hashAgentCredential } from './agent-credentials.js';
 
 function readCastNumber(name, fallback, minimum = 0) {
     const value = Number(process.env[name]);
@@ -359,21 +360,9 @@ function saveAgentCredentials() {
     try { fs.chmodSync(AGENT_CREDENTIALS_PATH, 0o600); } catch (e) {}
 }
 
-function hashAgentToken(token) {
-    return crypto.createHash('sha256').update(String(token)).digest('hex');
-}
-
-function rememberAgentCredential(stableSerial, payload) {
-    const token = typeof payload?.agent_token === 'string' ? payload.agent_token : '';
-    if (!token || !stableSerial) return;
-    agentCredentials[stableSerial] = {
-        token,
-        tokenHash: hashAgentToken(token),
-        pairingId: payload.pairing_id || null,
-        agentId: payload.agent_id || null,
-        stableId: stableSerial,
-        lastTimestamp: 0,
-    };
+function activateAgentCredential(stableSerial, payload, credential) {
+    const previous = agentCredentials[stableSerial] || {};
+    agentCredentials[stableSerial] = buildAgentCredentialRecord(stableSerial, payload, credential, previous);
     saveAgentCredentials();
 }
 
@@ -387,7 +376,7 @@ function verifyAgentRequest(req, data) {
         return candidates.every((candidate) => knownIdentities.has(String(candidate)));
     });
     if (!record) return { ok: false, status: 401 };
-    const actual = Buffer.from(hashAgentToken(presented));
+    const actual = Buffer.from(hashAgentCredential(presented));
     const expected = Buffer.from(String(record.tokenHash || ''));
     if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return { ok: false, status: 401 };
     if (data.timestamp === undefined) return { ok: false, status: 408 };
@@ -2510,16 +2499,22 @@ function runCommandOnce(deviceSerial, commandType, payloadStr, commandMeta = {})
         const agentPkg = payload.package_name || QUEST_AGENT_PACKAGE;
         if (!isValidPackage(agentPkg)) return resolve({ success: false, error: "Invalid package name" });
         if (!payload.apk_checksum) return resolve({ success: false, error: "Missing APK checksum in command payload" });
+        if (payload.agent_token || payload.agentToken) return resolve({ success: false, error: "Raw Agent credentials are not accepted in Cloud commands", errorCode: 'AGENT_CREDENTIAL_IN_COMMAND' });
+        if (payload.target !== 'quest_agent' || payload.rotate_agent_credential !== true) return resolve({ success: false, error: "Quest Agent provisioning intent is required", errorCode: 'AGENT_PROVISIONING_INTENT_REQUIRED' });
         const artifact = resolveApprovedApk({ ...payload, artifact_id: payload.artifact_id || path.basename(QUEST_AGENT_APK_PATH) }, { root: APK_ARTIFACT_ROOT, sha256File });
         if (artifact.error) return resolve({ success: false, error: artifact.error, errorCode: artifact.errorCode || 'APK_VALIDATION_FAILED' });
-        rememberAgentCredential(stableSerial, payload);
+        const candidateCredential = createAgentCredential();
         logHub('Agent', `Installing Quest Agent on ${adbRoute}`);
         spawnAdb(['-s', adbRoute, 'install', '-r', artifact.path], `Installed Agent`)
             .then((res) => {
                 if(res.success) {
                     logHub('Agent', `Starting Quest Agent on ${adbRoute}`);
-                    spawnAdb(buildAgentStartArgs(adbRoute, { agentToken: payload.agent_token }), `Started Agent installed`)
-                       .then(resolve);
+                    spawnAdb(buildAgentStartArgs(adbRoute, { agentToken: candidateCredential.token }), `Started Agent installed`)
+                       .then((startResult) => {
+                           if (!startResult.success) return resolve(startResult);
+                           activateAgentCredential(stableSerial, payload, candidateCredential);
+                           resolve({ ...startResult, ...buildAgentProvisioningResult(candidateCredential) });
+                       });
                 } else {
                     resolve(res);
                 }

@@ -41,4 +41,27 @@ describe("SQLite migration safety", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("scrubs legacy Agent credentials from persisted JSON fields", () => {
+    const db = createDatabase(":memory:");
+    const rawToken = "legacy-agent-credential-must-not-remain";
+    db.prepare(`INSERT INTO organizations(name, slug) VALUES ('Legacy Org', 'legacy-org-scrub')`).run();
+    db.prepare(`INSERT INTO clubs(organization_id, name, slug) VALUES (1, 'Legacy Club', 'legacy-club-scrub')`).run();
+    db.prepare(`INSERT INTO local_hubs(club_id, name) VALUES (1, 'Legacy Hub')`).run();
+    db.prepare(`INSERT INTO devices(club_id, local_hub_id, name, serial_number) VALUES (1, 1, 'Legacy Quest', 'LEGACY-SCRUB')`).run();
+    db.prepare(`DELETE FROM schema_migrations WHERE version = '0008_scrub_agent_credentials.sql'`).run();
+    db.prepare(`
+      INSERT INTO device_commands(organization_id, club_id, local_hub_id, device_id, type, payload, result_json)
+      VALUES (1, 1, 1, 1, 'INSTALL_APK', ?, ?)
+    `).run(JSON.stringify({ agent_token: rawToken }), JSON.stringify({ credential: rawToken }));
+    db.prepare(`INSERT INTO audit_logs(organization_id, club_id, action, entity_type, entity_id, details) VALUES (1, 1, 'legacy', 'device', '1', ?)`)
+      .run(JSON.stringify({ agent_token: rawToken }));
+
+    applyMigrations(db, migrationsDir);
+
+    const persisted = JSON.stringify(db.prepare(`SELECT payload, result_json FROM device_commands`).all())
+      + JSON.stringify(db.prepare(`SELECT details FROM audit_logs`).all());
+    assert.doesNotMatch(persisted, new RegExp(rawToken));
+    assert.match(persisted, /\[REDACTED\]/);
+  });
 });

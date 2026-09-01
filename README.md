@@ -31,6 +31,21 @@ flowchart TD
 
 The Express API owns authorization, durable state, command claiming, and session transitions. The Local Hub polls and reconciles typed commands, then runs ADB, scrcpy, and Quest Agent operations inside the club network. Cloud code never runs ADB or scrcpy directly, and the UI cannot submit arbitrary shell commands.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/dashboard.png" alt="BizonVR Operator club dashboard">
+</p>
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/devices.png" alt="BizonVR Operator device management"></td>
+    <td><img src="docs/screenshots/session-control.png" alt="BizonVR Operator session control"></td>
+  </tr>
+</table>
+
+UI shown with local demo data; physical Meta Quest end-to-end validation remains deferred.
+
 ## Why this project is technically interesting
 
 - Distributed Cloud API ↔ Local Hub orchestration across an unreliable LAN boundary.

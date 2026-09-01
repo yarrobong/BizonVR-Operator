@@ -1,5 +1,11 @@
 # Техническое задание: BizonVR Club Control
 
+> Статус: target product specification with current-runtime notes. Для
+> portfolio-facing описания реализации см. [README](README.md) и
+> [docs/architecture.md](docs/architecture.md). Эта спецификация не означает,
+> что physical Quest E2E, production deployment или production-scale load уже
+> проверены.
+
 ## 1. Назначение
 
 Система предназначена для централизованного управления Meta Quest-шлемами в VR-клубах: сессии, карта клуба, запуск приложений, установка APK, трансляция через scrcpy, мониторинг и подписка.
@@ -7,16 +13,23 @@
 ## 2. Платформы MVP
 
 - Шлемы: Meta Quest 2, Quest 3, Quest 3S, Quest Pro.
-- Local Hub: Windows 10/11.
-- Cloud: Linux server.
+- Local Hub: Node.js process on the club LAN; Windows 10/11 is the intended
+  operator deployment target, but packaging is not part of this repository.
+- Cloud/API: Node.js + Express + TypeScript + `better-sqlite3` in the current
+  runtime.
 - Panel: desktop web.
-- Quest Agent/Launcher: Android/Kotlin, без Unity.
+- Quest Agent/Launcher: Android/Kotlin with the Meta Spatial SDK path, без
+  Unity. Current project: `quest-agent-spatial-spike`.
 
 ## 3. Компоненты
 
 ### 3.1 Backend
 
-Рекомендуемый стек: Django + DRF + PostgreSQL + Redis + Celery/Dramatiq + WebSocket.
+Фактически реализованный стек: Node.js + Express + TypeScript +
+`better-sqlite3` + Zod. Django, DRF, PostgreSQL, Redis, Celery/Dramatiq и
+WebSocket не являются текущими зависимостями; они встречались только в раннем
+варианте проектирования и могут рассматриваться как отдельный future
+deployment track.
 
 Основные зоны ответственности:
 
@@ -52,7 +65,9 @@
 
 ### 3.3 Local Hub
 
-Рекомендуемый стек: TypeScript + Electron/Tauri + SQLite.
+Фактически реализованный runtime: Node.js JavaScript + локальный SQLite cache/
+journal. Electron/Tauri packaging и отдельное desktop distribution не входят в
+текущий репозиторий.
 
 Функции:
 
@@ -69,7 +84,8 @@
 
 ### 3.4 Quest Agent / Club Launcher
 
-Рекомендуемый стек: Kotlin + Android SDK.
+Фактически реализованный путь: Kotlin + Android SDK + Meta Spatial SDK в
+`quest-agent-spatial-spike`.
 
 Функции:
 
@@ -414,7 +430,7 @@ Backend должен отдавать:
 
 ## 14. Безопасность
 
-- JWT/session auth для панели.
+- HMAC Bearer auth для панели с production `AUTH_SECRET`.
 - Отдельный токен для Local Hub.
 - Pairing token для Quest Agent.
 - RBAC по ролям.

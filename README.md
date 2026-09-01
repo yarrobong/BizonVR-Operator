@@ -1,96 +1,182 @@
-# BizonVR Club Control
+# BizonVR Operator
 
 [![CI](https://github.com/yarrobong/BizonVR-Operator/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/yarrobong/BizonVR-Operator/actions/workflows/ci.yml)
 
-This repository combines the MVP requirements for the BizonVR Meta Quest management system.
-We utilize a full-stack Node.js + Express + React architecture configured to run on a single cloud service to ease deployment and meet AI Studio runtime requirements, while splitting out the local components.
+BizonVR Operator is a portfolio-scale MVP for running a Meta Quest fleet in a VR club. It gives an operator one web panel for devices, club rooms, sessions, diagnostics, APK provisioning, and casting. The interesting part is the hardware boundary: cloud orchestration stays separate from the LAN-local process that can actually reach a headset.
 
+## What it does
 
-scrcpy -b 25M --max-size=1600 --crop=1600:1000:116:460 --no-audio
+```mermaid
+flowchart TD
+    Browser[Browser]
+    Panel[React Web Panel]
+    API[Express API<br/>HMAC auth + tenant authorization]
+    DB[(SQLite persistence<br/>command and session journal)]
+    Hub[Local Hub<br/>LAN hardware boundary]
+    ADB[ADB<br/>verified device routes]
+    Cast[scrcpy / ffmpeg<br/>managed casting]
+    Agent[Quest Agent HTTP<br/>heartbeat + launcher state]
+    Quest[Meta Quest]
 
-## Directory Structure
-
-*   \`/src/server/\` and \`server.ts\` - **Cloud Backend** (Express, standard REST API + SQLite mock for MVP)
-*   \`/src/components/\` and \`/src/pages/\` - **Web Operator Panel** (React, Tailwind, TanStack Query)
-*   \`/local-hub/\` - **Local Hub** (Node.js script polling the backend for device commands)
-*   \`/quest-agent-spatial-spike/\` - **Quest Agent** production Android/Kotlin app for Meta Quest
-*   \`/docs/\` - Documentation files
-
-## Running the Architecture
-
-1.  The cloud backend and web UI run via \`npm run dev\`.
-2.  The local hub runs via \`npm run hub:dev\`.
-
-## Local Development Notes
-
-- The backend uses port \`3000\`.
-- The Local Hub mini-server should use \`3001\` locally so it does not conflict with the backend.
-- When the Quest Agent is launched by Local Hub, the hub passes its IP and port to the headset automatically and opens the agent through the Quest VR launcher entry, not by directly starting the raw activity.
-- Device casting now opens inside the web operator panel. The browser requests the stream URL from the cloud API, then connects to the Local Hub mini-server on \`HUB_PORT\`.
-- To make \`INSTALL_APK\` work, first build the Android app so the APK exists at \`quest-agent-spatial-spike/app/build/outputs/apk/debug/app-debug.apk\`, or override \`QUEST_AGENT_APK_PATH\`.
-- To keep Quest control stable over Wi-Fi, enable \`ENABLE_WIRELESS_ADB=1\` on Local Hub after the first trusted USB connection. The hub caches the stable USB serial and reconnects to the remembered \`ip:5555\` route on later sync cycles.
-
-## Debugging Logs
-
-- Web/backend logs: run \`npm run dev\` and watch the terminal for API errors and command status updates.
-- Local Hub logs: run \`ENABLE_WIRELESS_ADB=1 npm run hub:dev\` and watch for \`[Routing]\`, \`[Command]\`, \`[Wake]\`, \`[Heartbeat]\`, and \`[Agent]\` lines.
-- Quest Agent logs on the headset: use \`adb logcat | grep BizonVRQuestAgent\` to see received intents, heartbeat success/failure, and package launch errors.
-- If launches are flaky, compare the serial in \`[Routing]\` logs. If the route flips between a USB serial and \`ip:5555\`, the wake path is the first place to inspect.
-
-## Constraints Addressed
-- Command chain: Web -> Cloud API -> DeviceCommand DB -> Local Hub Sync.
-- No direct cloud-to-device ADB.
-- Safe process runners for ADB commands.
-- ADB recovery is single-flight per Quest with bounded backoff, identity verification, stale-route protection, and timeout-bounded async process execution. See [ADB reliability](docs/adb-reliability.md).
-- Casting uses one managed producer per stable Quest, viewer fan-out, bounded backpressure, generation-safe recovery, SIGTERM/SIGKILL cleanup, and configurable resource limits. See [Cast reliability](docs/cast-reliability.md).
-- Session Engine uses Cloud-owned durable timestamps, strict transitions, one active session per Quest, revision/idempotency guards, foreground launch verification, heartbeat reconciliation, and confirmed cleanup. See [Session reliability](docs/session-reliability.md).
-
-## Real hardware ADB validation
-
-Run the non-production soak harness against a real Quest using its stable identity:
-
-```bash
-node scripts/adb-hardware-soak.js --device '<stable-id>' --duration 30m --interval 5s --api-url http://localhost:3000 --verbose
+    Browser --> Panel --> API
+    API <--> DB
+    API <-->|authenticated sync| Hub
+    Hub --> ADB
+    Hub --> Cast
+    Hub --> Agent
+    ADB --> Quest
+    Cast --> Quest
+    Agent --> Quest
 ```
 
-It writes JSON and human-readable artifacts under `artifacts/adb-soak/`. The
-full physical scenario checklist is in [ADB hardware test plan](docs/adb-hardware-test-plan.md).
-If no Quest is connected, the harness records `NOT RUN`; fake ADB tests never
-count as hardware evidence.
+The Express API owns authorization, durable state, command claiming, and session transitions. The Local Hub polls and reconciles typed commands, then runs ADB, scrcpy, and Quest Agent operations inside the club network. Cloud code never runs ADB or scrcpy directly, and the UI cannot submit arbitrary shell commands.
 
-For the full session path, configure `SESSION_HARDWARE_API_URL`,
-`SESSION_HARDWARE_DEVICE_ID` and `SESSION_HARDWARE_APP_PACKAGE`, then run
-`node scripts/session-hardware-soak.js`. It uses the public API pipeline and
-does not claim PASS without physical verification. The complete acceptance
-sequence is in [Session hardware test plan](docs/session-hardware-test-plan.md).
+## Why this project is technically interesting
 
-For real-device casting validation, use `node scripts/cast-hardware-soak.js --device '<adb-route>' --api-url http://<hub-lan-ip>:3001 --duration 30m --interval 5s --profile low-latency`. It records first-frame latency, stream failures, bytes, and ADB availability; absent hardware is reported as `NOT RUN`.
+- Distributed Cloud API ↔ Local Hub orchestration across an unreliable LAN boundary.
+- Typed device commands with idempotency keys, durable claims, leases, retries, and reconciliation.
+- Tenant and club scope checks combined with subscription feature and device-limit enforcement.
+- HMAC Bearer authentication for the Web API and per-Hub credentials for transport.
+- Local Agent credential provisioning: the Hub keeps the raw credential locally while Cloud stores only its hash.
+- Freshness and monotonic-timestamp checks for Quest Agent heartbeats.
+- APK artifact identity and SHA-256 validation before ADB installation.
+- ADB route recovery that keeps stable device identity separate from USB/Wi-Fi routes and IP addresses.
+- Casting with one managed producer per Quest, bounded backpressure, fallback transport, and process cleanup.
+- SQLite migrations and transactions for session, command, audit, and credential-scrubbing safety.
+- React management UI, Kotlin Android Quest Agent, and automated Node/Gradle CI.
 
-## Quest connection stability model
+## Implemented capabilities
 
-- First trusted Quest connection is done over USB. The operator must accept USB debugging in the headset.
-- After first trust, Local Hub may enable and use Wi-Fi ADB with `ENABLE_WIRELESS_ADB=1`.
-- ADB is not the production online status. ADB is used for install, start, recovery, and debug.
-- The primary online signal is Quest Agent heartbeat from `quest-agent-spatial-spike`.
-- Device identity is `stable_id`, `agent_id`, and `android_id`; IP is only a route hint.
-- When Quest IP changes, update `last_known_ip` and `previous_ips`; do not create a duplicate device.
-- Local Hub must pass a real LAN `HUB_HOST` and `HUB_PORT` to Quest Agent. Do not use `127.0.0.1` for production Wi-Fi heartbeat.
-- `HUB_HOST`/`HUB_PORT` must be reachable from the headset on the same Wi-Fi/LAN.
-- If the headset is powered off, deeply asleep, or on another network, Local Hub cannot guarantee ADB recovery without operator action.
+The current repository contains source and tests for:
 
-## ADB limitations
+- organizations, clubs, rooms, devices, Local Hubs, subscriptions, and audit logs;
+- device health/status projections, Agent heartbeat ingestion, operator-call flow, and diagnostics;
+- typed command creation, status transitions, cancellation, delivery claims, and result reconciliation;
+- session start, pause, resume, extension, app switching, completion, and failure handling;
+- app inventory and checksum-verified Quest Agent/APK installation commands;
+- app launch/stop, launcher return, ADB repair/reconnect, and managed scrcpy casting;
+- club-map and device-management screens built with React, TanStack Query, Zustand, and Tailwind.
 
-- Wi-Fi ADB can drop after reboot, sleep, OS update, network change, or USB debugging reset.
-- A powered-off or deeply sleeping Quest cannot be reliably woken only through ADB.
-- First USB debugging trust requires a human confirmation inside the headset.
-- If the same Quest is visible over USB and Wi-Fi, every command must use `adb -s <route>`.
-- Cloud Backend/Web must not connect to Quest or run ADB directly.
-- Local Hub must be on the same network as Quest and is the only component allowed to run ADB/scrcpy.
+These are code-level capabilities. Physical headset behavior is explicitly still pending validation.
 
-## Operator recovery checklist
+## Actual technology stack
 
-1. Ensure Quest is powered on and connected to the same Wi-Fi as Local Hub.
-2. If Agent is online but ADB is degraded, click Reconnect ADB.
-3. If ADB is online but Agent is offline, click Relaunch Agent.
-4. If both are offline, connect USB and click Repair via USB.
-5. If after reboot heartbeat goes to `127.0.0.1`, treat it as a bug in HUB_IP persistence.
+| Area | Implementation |
+| --- | --- |
+| Web panel | React 19, TypeScript, Vite, TanStack Query, Zustand, Tailwind CSS |
+| Cloud/API | Node.js, Express 4, TypeScript, better-sqlite3, Zod |
+| Local Hub | Node.js, ADB integration, scrcpy, ffmpeg, local credential storage, command reconciliation |
+| Quest Agent | Android, Kotlin, Android SDK, Meta Spatial SDK path; no Unity |
+| Quality | `node:test` via `tsx`, GitHub Actions, Gradle Android tests/build |
+
+SQLite is the current repository runtime for the API and the Local Hub keeps its own local cache/journal. PostgreSQL, Redis, Django, Celery, and WebSocket infrastructure are not implemented in this repository.
+
+## Security model
+
+- Production Web API requests require signed HMAC Bearer tokens using `AUTH_SECRET`.
+- The server resolves the token subject to an active user and enforces organization/club scope, role permissions, subscription features, and device limits.
+- Local Hub transport uses Hub credentials; Quest Agent credentials are pairing-bound and compared in constant time.
+- The Hub stores the raw Agent credential in a local mode-0600 cache; Cloud persists only the SHA-256 hash.
+- Heartbeats require a fresh, monotonic timestamp and a matching device identity.
+- Command and result JSON rejects raw credentials, while audit/session data is recursively redacted.
+- APK operations accept approved artifact IDs and verify containment, symlinks, and SHA-256 before ADB.
+- Request bodies and ADB/process output have explicit size limits; migrations run transactionally.
+
+Development-only auth fallbacks are explicit environment flags and must not be enabled in production. This project makes no formal security-certification claim.
+
+## Reliability model
+
+The command journal is durable at both the Cloud/API and Local Hub boundaries. Commands are claimed with leases, serialized per stable device identity, retried only under semantic policies, and reconciled after uncertain outcomes. Session state uses durable timestamps, guarded transitions, one-active-session constraints, and confirmed cleanup before completion. Restart recovery, ADB route replacement, offline buffering, and cast process cleanup are covered by fault-oriented tests.
+
+Detailed design notes:
+
+- [Backend architecture](docs/backend-architecture.md)
+- [Local Hub architecture](docs/local-hub-architecture.md)
+- [ADB reliability](docs/adb-reliability.md)
+- [Session reliability](docs/session-reliability.md)
+- [Cast reliability](docs/cast-reliability.md)
+- [Security hardening](docs/security-hardening.md)
+
+## Quick start
+
+```bash
+npm ci
+npm run dev
+```
+
+The API listens on `http://localhost:3000`. Copy [.env.example](.env.example) only when you need local configuration. `AUTH_SECRET` is required for production signed authentication; the development fallback is intentionally opt-in and is intended for local API/test use, not as a production login mechanism.
+
+To run the LAN-local process during development:
+
+```bash
+npm run hub:dev
+```
+
+The Hub expects `APP_URL=http://localhost:3000` and uses port `3001` by default. It requires locally installed `adb`, and casting additionally requires `scrcpy` and `ffmpeg`. Build the Android debug APK when testing APK installation:
+
+```bash
+cd quest-agent-spatial-spike
+./gradlew assembleDebug
+cd ..
+```
+
+Useful verification commands are `npm run lint`, `npm test`, `npm run build`, and `npm run hub`. There is no physical-device prerequisite for the automated suite.
+
+## Project structure
+
+```text
+src/
+  backend/          Express routes, services, and repositories
+  components/       Shared React layout
+  pages/            Map, devices, and casting screens
+db/migrations/      API SQLite schema migrations
+local-hub/
+  agent/            Quest Agent HTTP/auth/provisioning
+  commands/         Typed dispatch, workers, reconciliation
+  devices/          Identity, ADB routes, diagnostics, app discovery
+  cast/             scrcpy/ffmpeg stream service
+quest-agent-spatial-spike/
+  app/src/          Kotlin Quest Agent and soft-launcher implementation
+tests/              Node, security, reliability, migration, and UI helper tests
+docs/               Architecture, CI, reliability, security, and test plans
+```
+
+## Testing and CI
+
+The verified baseline is 134 Node tests across 23 suites. GitHub Actions exposes two required checks:
+
+- **Node / verify** — `npm ci`, TypeScript validation, all Node tests, production build, Local Hub JavaScript syntax checks, and HIGH/CRITICAL npm audit gates.
+- **Android / verify** — Gradle unit tests and `assembleDebug` using the repository wrapper.
+
+CI runs in Ubuntu/Java/Node environments and does not use ADB, an emulator, or physical Quest hardware. See [docs/ci.md](docs/ci.md).
+
+## Current validation status
+
+Verified:
+
+- Node test suite: 134 tests, 23 suites;
+- backend authorization, tenant isolation, command/session reliability, APK safety, and audit behavior covered by automated tests;
+- frontend production build and Local Hub JavaScript syntax;
+- Android unit/build validation for `quest-agent-spatial-spike`;
+- GitHub Actions workflow definitions and required check names.
+
+Not yet verified:
+
+- full end-to-end operation on physical Meta Quest hardware;
+- production deployment;
+- production-scale multi-club load behavior.
+
+The Android project name `quest-agent-spatial-spike` is retained to avoid unnecessary Gradle/package churn. It is the current production Quest app path in this repository, with the historical name called out explicitly.
+
+## Documentation map
+
+- [Portfolio summary](docs/portfolio-summary.md) — interview-ready overview of the problem, architecture, decisions, and validation.
+- [CI](docs/ci.md) — workflow behavior and branch-protection checks.
+- [Architecture](docs/architecture.md) — current runtime boundaries and storage responsibilities.
+- [Database design](docs/database.md) — current SQLite schema/runtime and migration notes.
+- [Device commands](docs/commands.md) — typed command contract and safety rules.
+- [Hardware test plans](docs/adb-hardware-test-plan.md) and [session hardware test plan](docs/session-hardware-test-plan.md) — future physical validation procedures.
+
+## Scope and limitations
+
+This is a Meta Quest MVP. Pico, Unity-based Agent code, direct Cloud-to-Quest control, arbitrary shell execution, and consumer-Quest full kiosk guarantees are out of scope. The repository does not claim physical Quest E2E validation, production deployment, or production-scale load testing.

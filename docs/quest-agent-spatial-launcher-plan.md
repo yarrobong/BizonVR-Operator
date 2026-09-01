@@ -2,6 +2,7 @@
 
 > Historical document. Current production Quest app is `quest-agent-spatial-spike` (`com.bizonvr.spatialspike`).
 > Do not use the older `quest-agent` or `.MainActivity` alias as the default production launch path unless explicitly requested.
+> Physical Quest statements in this historical migration record are not Stage 6 validation evidence; current physical E2E remains deferred.
 
 ## 1. Audit summary
 
@@ -97,7 +98,7 @@
 1. Исходная сборка старого `quest-agent` проходила, но direct Spatial integration падала на `:compileDebugKotlin`.
 2. Отдельный standalone spike позволил сузить конфликт toolchain.
 3. После выравнивания Kotlin compiler artifacts и переноса stack в основной `quest-agent` сборка начала проходить.
-4. `SpatialLauncherActivity` собирается, ставится на Quest и запускается как immersive shell.
+4. `SpatialLauncherActivity` is covered by the historical migration record; current Stage 6 verifies the Android build only, while physical install/launch remains deferred.
 
 Исторический blocker был такой:
 

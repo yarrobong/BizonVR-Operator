@@ -1,103 +1,71 @@
-# Architecture
+# Current Architecture
 
-## Command Chain
+This document describes the implementation in this repository. The system is
+an Express/SQLite API plus a LAN-local Node.js Hub; PostgreSQL, Redis, Django,
+Celery, and WebSocket infrastructure are not part of the current runtime.
+
+## Command chain
 
 ```text
-Web Panel -> Cloud API -> PostgreSQL device_commands -> Redis notify/publish -> Local Hub -> ADB/scrcpy/Quest Agent -> Meta Quest
+Browser -> React Web Panel -> Express API -> SQLite command/session journal
+                                      <-> authenticated Local Hub sync
+                                           -> typed handlers
+                                              -> ADB / scrcpy / Quest Agent
+                                                 -> Meta Quest
 ```
 
-Cloud never runs `adb`, never starts `scrcpy`, and never talks directly to the headset.
+The Cloud/API process never runs ADB or scrcpy and never connects to a Quest
+directly. The Local Hub is the only component allowed to cross the LAN hardware
+boundary.
 
-## Storage Responsibilities
+## Storage responsibilities
 
-### PostgreSQL
+### API SQLite
 
-Primary source of truth for:
+The API uses `better-sqlite3` with ordered SQL migrations, foreign keys, WAL
+mode, and transactional domain operations. It persists organizations, clubs,
+rooms, users, subscriptions, devices, app inventory, commands, sessions,
+session events, telemetry projections, and audit logs.
 
-- tenants and clubs
-- devices and app inventory
-- durable device commands
-- sessions and session history
-- monitoring alerts
-- subscription enforcement
-- audit logs
+`device_commands` is the durable Cloud-side command journal. Session actions
+write their state, events, and commands together where the transition requires
+atomicity.
 
-### Redis
+### Local Hub cache
 
-Operational layer only:
+The Hub keeps a separate local SQLite journal/cache for known devices, command
+claims and results, casts, and events that need to be synchronized after a
+short connectivity loss. It does not replace Cloud authorization or invent
+arbitrary commands while offline.
 
-- fast command fan-out to connected Local Hubs
-- live hub/device presence
-- heartbeat TTLs
-- queue wakeups and pub/sub
-- short-lived dashboards and cache entries
-- distributed locks for session start / finish / installation jobs
+### Quest Agent state
 
-Redis must not be the only copy of a command or session lifecycle event.
+The Android Agent keeps only the local pairing/session/launcher state needed to
+send authenticated heartbeats and display the soft-launcher experience. Its
+raw Agent credential is not stored by Cloud.
 
-### Local Hub SQLite
+## Security boundaries
 
-Autonomous branch-side cache for:
+- Web requests use signed HMAC Bearer tokens in production.
+- The API resolves the authenticated subject to an active user and checks
+  organization/club scope, role, subscription features, and device limits.
+- Local Hub requests use Hub credentials; Agent heartbeat requests use a
+  pairing-bound credential, fresh timestamp, and stable identity.
+- Only typed command handlers can invoke ADB or managed casting. Raw shell input
+  is not part of the API contract.
 
-- locally known devices
-- accepted commands
-- active sessions and session devices
-- scrcpy state
-- unsynced events while internet is down
+## Reliability boundaries
 
-When cloud connectivity drops, Local Hub continues:
+Commands are claimed with leases, serialized per stable device identity, and
+reconciled after uncertain outcomes. ADB route changes do not create new Quest
+identities: stable ID, Agent ID, Android ID, and transport routes remain
+separate. Session timers are based on durable timestamps, and completion waits
+for confirmed cleanup. See [backend architecture](backend-architecture.md),
+[Local Hub architecture](local-hub-architecture.md), and
+[session reliability](session-reliability.md).
 
-- finishing already accepted commands
-- maintaining active session timers
-- returning devices to launcher on session end
-- collecting telemetry and syncing it later
+## Historical design notes
 
-### Quest Agent Local Storage
-
-Minimal Android-side state only:
-
-- pairing ID
-- current session timer state
-- launcher configuration
-- last known hub endpoint
-
-Recommended implementation:
-
-- `SharedPreferences` for pairing/session metadata
-- optional tiny Room/SQLite table only if offline message queue becomes necessary
-
-## SaaS Boundaries
-
-- `organization` is the tenant and billing scope.
-- `club` is the physical VR venue.
-- `zone` and `room` drive the operator map.
-- `local_hub` is the only component allowed to execute ADB and `scrcpy`.
-
-## Session Mode
-
-Session mode is the main business workflow:
-
-1. Operator chooses room, game, duration, devices, and optional casting.
-2. Cloud validates subscription, club scope, device availability, hub online, app presence, battery, storage, and active conflicts.
-3. Cloud writes `sessions`, `session_devices`, `session_events`, and `device_commands`.
-4. Local Hub receives commands, launches the game, starts `scrcpy` if needed, and keeps heartbeat/telemetry flowing.
-5. On finish, Local Hub stops the game, reopens the Kotlin launcher, and syncs completion back to cloud.
-
-## Failure Model
-
-### If Redis fails
-
-- commands still exist in PostgreSQL
-- Local Hub can continue polling from cloud
-
-### If internet fails
-
-- cloud cannot dispatch new work immediately
-- Local Hub can finish already accepted work using SQLite cache
-- telemetry and events are buffered and synced later
-
-### If Local Hub fails
-
-- cloud marks hub offline from heartbeat TTL
-- devices in that club move into partial offline visibility
-- new commands stay in PostgreSQL with visible operator status
+Earlier design documents explored a PostgreSQL/Redis deployment. That is useful
+background, but it is not an implementation claim for this repository. The
+current database/runtime details are in [database.md](database.md).

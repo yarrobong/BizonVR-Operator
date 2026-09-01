@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: Node / verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript / lint
+        run: npm run lint
+
+      - name: Node tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+      - name: Local Hub JS syntax
+        run: find local-hub -name '*.js' -print0 | xargs -0 -n1 node --check
+
+      - name: npm security audit
+        run: npm audit --audit-level=high
+
+      - name: Production npm security audit
+        run: npm audit --omit=dev --audit-level=high
+
+  android:
+    name: Android / verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Ensure Gradle wrapper is executable
+        working-directory: quest-agent-spatial-spike
+        run: chmod +x gradlew
+
+      - name: Android unit tests
+        working-directory: quest-agent-spatial-spike
+        run: ./gradlew test
+
+      - name: Android debug build
+        working-directory: quest-agent-spatial-spike
+        run: ./gradlew assembleDebug

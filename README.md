@@ -1,5 +1,7 @@
 # BizonVR Club Control
 
+[![CI](https://github.com/yarrobong/BizonVR-Operator/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/yarrobong/BizonVR-Operator/actions/workflows/ci.yml)
+
 This repository combines the MVP requirements for the BizonVR Meta Quest management system.
 We utilize a full-stack Node.js + Express + React architecture configured to run on a single cloud service to ease deployment and meet AI Studio runtime requirements, while splitting out the local components.
 

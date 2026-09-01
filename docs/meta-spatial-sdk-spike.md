@@ -1,9 +1,12 @@
-# Meta Spatial SDK Spike
+# Meta Spatial SDK Spike (historical)
 
 Дата: 2026-05-26
 
 > Current production Quest app is `quest-agent-spatial-spike` (`com.bizonvr.spatialspike`).
 > The older `quest-agent` project is deprecated/non-production unless a task explicitly says otherwise.
+>
+> This is a historical toolchain record. Stage 6 re-verifies builds only; it
+> does not claim physical Quest installation, launch, or end-to-end validation.
 
 ## Что это
 
@@ -26,7 +29,9 @@ Spike выполнил свою задачу:
 - позволил локализовать конфликт toolchain;
 - дал рабочую основу для переноса в production APK.
 
-По состоянию на сейчас immersive launcher уже живёт в основном `quest-agent` как `SpatialLauncherActivity`.
+По текущему repository state production path остаётся
+`quest-agent-spatial-spike`; старый `quest-agent` не является production
+артефактом.
 
 ## Что было проверено
 
@@ -108,21 +113,19 @@ Could not serialize value of type GradleKotlinCompilerWorkArguments
 
 Проект:
 
-- [quest-agent-spatial-spike/settings.gradle.kts](/Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent-spatial-spike/settings.gradle.kts)
-- [quest-agent-spatial-spike/build.gradle.kts](/Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent-spatial-spike/build.gradle.kts)
-- [quest-agent-spatial-spike/gradle/libs.versions.toml](/Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent-spatial-spike/gradle/libs.versions.toml)
-- [quest-agent-spatial-spike/app/build.gradle.kts](/Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent-spatial-spike/app/build.gradle.kts)
-- [quest-agent-spatial-spike/app/src/main/AndroidManifest.xml](/Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent-spatial-spike/app/src/main/AndroidManifest.xml)
-- [quest-agent-spatial-spike/app/src/main/java/com/bizonvr/spatialspike/SpatialSpikeActivity.kt](/Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent-spatial-spike/app/src/main/java/com/bizonvr/spatialspike/SpatialSpikeActivity.kt)
+- [quest-agent-spatial-spike/settings.gradle.kts](../quest-agent-spatial-spike/settings.gradle.kts)
+- [quest-agent-spatial-spike/build.gradle.kts](../quest-agent-spatial-spike/build.gradle.kts)
+- [quest-agent-spatial-spike/gradle/libs.versions.toml](../quest-agent-spatial-spike/gradle/libs.versions.toml)
+- [quest-agent-spatial-spike/app/build.gradle.kts](../quest-agent-spatial-spike/app/build.gradle.kts)
+- [quest-agent-spatial-spike/app/src/main/AndroidManifest.xml](../quest-agent-spatial-spike/app/src/main/AndroidManifest.xml)
+- [quest-agent-spatial-spike/app/src/main/java/com/bizonvr/spatialspike/SpatialSpikeActivity.kt](../quest-agent-spatial-spike/app/src/main/java/com/bizonvr/spatialspike/SpatialSpikeActivity.kt)
 
 ## Как собрать
 
-### Основной quest-agent
+### Deprecated quest-agent reference
 
-```bash
-cd /Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent
-./gradlew clean assembleDebug
-```
+The older `quest-agent` project is retained as a deprecated reference and is
+not the Stage 6 production validation target.
 
 ### Spatial spike
 
@@ -134,13 +137,13 @@ cd /Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent
 2. Или создать `quest-agent-spatial-spike/local.properties`:
 
 ```properties
-sdk.dir=/Users/Yaroslav/Library/Android/sdk
+sdk.dir=/path/to/Android/sdk
 ```
 
 Сборка:
 
 ```bash
-cd /Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent-spatial-spike
+cd quest-agent-spatial-spike
 ./gradlew clean assembleDebug
 ```
 
@@ -156,27 +159,18 @@ quest-agent-spatial-spike/app/build/outputs/apk/debug/app-debug.apk
 
 ```bash
 adb devices -l
-adb -s <serial> install -r /Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent-spatial-spike/app/build/outputs/apk/debug/app-debug.apk
+adb -s <serial> install -r quest-agent-spatial-spike/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Для Quest из текущего окружения serial был:
-
-```text
-192.168.0.3:5555
-```
-
-Пример:
-
-```bash
-adb -s 192.168.0.3:5555 install -r /Users/Yaroslav/Documents/dev/BizonVR-Operator/quest-agent-spatial-spike/app/build/outputs/apk/debug/app-debug.apk
-```
+Physical installation is a deferred manual step; use the stable ADB route
+provided by the club environment when that validation is authorized.
 
 ## Как запустить Activity
 
 Через launcher icon на Quest или через ADB:
 
 ```bash
-adb -s 192.168.0.3:5555 shell am start -n com.bizonvr.spatialspike/.SpatialSpikeActivity
+adb -s <serial> shell am start -n com.bizonvr.spatialspike/.SpatialSpikeActivity
 ```
 
 ## Что должно появиться в headset
@@ -195,27 +189,21 @@ adb -s 192.168.0.3:5555 shell am start -n com.bizonvr.spatialspike/.SpatialSpike
 4. Фон сцены тёмный.
 5. `SESSION_ACTION START/STOP` меняют состояние launcher.
 
-## Что получилось проверить фактически
+## Что проверяется автоматически в текущем Stage 6
 
-- `quest-agent` продолжает собираться отдельно.
-- standalone `quest-agent-spatial-spike` собирается.
-- APK сгенерирован.
-- APK устанавливается на Quest.
-- `SpatialSpikeActivity` запускается через `adb shell am start`.
+- standalone `quest-agent-spatial-spike` проходит Gradle unit tests.
+- `quest-agent-spatial-spike` собирается через `assembleDebug`.
+- physical install/launch and headset UI behavior remain deferred.
 
-Что не удалось подтвердить до конца в этом прогоне:
-
-- я не снимал отдельный скриншот из headset и не фиксировал все session-state визуально по шагам.
+Отдельные physical Quest screenshots и session-state checks в Stage 6 не
+проводились.
 
 ## Что делать теперь
 
-Для повседневной разработки launcher лучше использовать основной `quest-agent`, потому что именно он теперь содержит:
-
-- `MainActivity` как 2D fallback;
-- `SpatialLauncherActivity` как immersive launcher;
-- общий `AgentSessionController`.
-
-Spike имеет смысл оставлять для:
+`quest-agent-spatial-spike` является текущим production path в этом
+репозитории. Проект имеет историческое имя и сохраняется без переименования,
+чтобы не создавать лишний Gradle/package churn. Старый `quest-agent` имеет
+смысл оставлять только для:
 
 - быстрых экспериментов с Meta Spatial SDK;
 - проверки будущих обновлений toolchain;

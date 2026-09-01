@@ -1,162 +1,55 @@
 # Database Design
 
-## Overview
+This document describes the current repository runtime. The Cloud/API uses
+`better-sqlite3`; the Local Hub has a separate SQLite cache. PostgreSQL and
+Redis are future deployment options, not running dependencies in this codebase.
 
-BizonVR Club Control uses a layered storage model:
+## API database
 
-- PostgreSQL is the source of truth for cloud data and all business entities.
-- Redis is ephemeral infrastructure for delivery, fan-out, locking, and live views.
-- Local Hub keeps a SQLite cache to continue sessions and command execution when cloud connectivity is lost.
-- Quest Agent stores only minimal local state on-device.
+The database is created by `src/backend/db/connection.ts` and upgraded by the
+ordered SQL files under `db/migrations/`. Connections enable foreign keys and
+WAL mode. Migration application is transactional, and legacy Agent credential
+fields are scrubbed by the credential-safety migration.
 
-This repository currently runs on `better-sqlite3` for MVP development, but the schema is intentionally designed to map 1:1 to PostgreSQL production tables.
+Core domains currently represented in the schema include:
 
-## Core Domains
+- organizations, users, clubs, zones, rooms, and subscriptions;
+- Local Hubs, devices, stable identity/route fields, and telemetry projections;
+- apps, app versions, installed-app associations, and APK checksums;
+- durable device commands, command events, sessions, session devices, and
+  session events;
+- audit logs and operator-call/monitoring state.
 
-### Organization and Access
+The exact schema source is [0001_initial.sql](../db/migrations/0001_initial.sql),
+with later migrations adding route identity, session lifecycle/reliability, and
+Agent authentication protections.
 
-- `organizations`: tenant root for billing, quotas, clubs, and audit scope.
-- `users`: SaaS users scoped to an organization with platform role and status.
-- `subscription_plans`: catalog of commercial plans and enabled features.
-- `organization_subscriptions`: active plan, limits, and overrides for each organization.
+## Durable command and session state
 
-### Club Topology
+`device_commands` stores the typed command, tenant/routing scope, target stable
+identity, status, timestamps, retry data, lease information, and result/error
+details. The service layer uses SQLite transactions for command claiming,
+session transitions, event writes, and audit writes that must agree.
 
-- `clubs`: a real operating location owned by an organization.
-- `club_zones`: logical map sections such as main floor, arena wing, or training zone.
-- `club_rooms`: operator-facing playable spaces shown on the club map.
-- `local_hubs`: on-premise bridge nodes bound to a club.
+Session state is Cloud-authoritative. Durable start/pause/extension timestamps,
+revision fields, and the one-active-session constraint prevent a refresh,
+restart, or duplicate request from silently creating a second active session.
 
-### Devices and Apps
+## Local Hub cache
 
-- `devices`: Meta Quest headsets managed through Local Hub and Quest Agent.
-- `apps`: app catalog metadata, including launcher and third-party games.
-- `app_versions`: versioned APK artifacts with checksum.
-- `device_apps`: installation state per device.
+The Local Hub cache schema is [local-hub/migrations/0001_cache.sql](../local-hub/migrations/0001_cache.sql).
+It stores:
 
-### Commands and Sessions
+- last known Cloud device/session projections;
+- accepted commands, leases, retry state, and durable results;
+- cast lifecycle state;
+- outbound events produced while the Hub is temporarily offline.
 
-- `device_commands`: durable command queue persisted in PostgreSQL and delivered through Local Hub.
-- `sessions`: business session aggregate.
-- `session_devices`: per-headset execution inside a session.
-- `session_events`: timeline of events for session orchestration and support.
-- `scrcpy_streams`: cast lifecycle records. Actual `scrcpy` processes run only on Local Hub.
+This cache supports reconciliation and safe shutdown. It is not a second
+authorization system and is not exposed as a Cloud database.
 
-### Monitoring and Audit
+## Planned deployment migration
 
-- `device_telemetry`: time-series snapshots from Local Hub and Agent.
-- `device_events`: device-specific technical events.
-- `monitoring_alerts`: operator-visible alerts with severity and lifecycle.
-- `audit_logs`: immutable business/security audit trail.
-
-## Status Enums
-
-### Device status
-
-- `new`
-- `pairing_required`
-- `online`
-- `offline`
-- `busy`
-- `in_session`
-- `installing`
-- `updating`
-- `maintenance_required`
-- `charging_required`
-- `error`
-- `disabled`
-
-### Command status
-
-- `created`
-- `sent_to_hub`
-- `accepted_by_hub`
-- `running`
-- `succeeded`
-- `failed`
-- `timeout`
-- `cancelled`
-
-### Session status
-
-- `draft`
-- `preparing`
-- `ready`
-- `starting`
-- `running`
-- `paused`
-- `extended`
-- `finishing`
-- `completed`
-- `cancelled`
-- `failed`
-
-### Monitoring severity
-
-- `info`
-- `warning`
-- `critical`
-- `blocker`
-
-## Relational Flow
-
-```text
-organizations
-  -> clubs
-    -> club_zones
-    -> club_rooms
-    -> local_hubs
-    -> devices
-    -> sessions
-
-devices
-  -> device_apps
-  -> device_commands
-  -> device_telemetry
-  -> device_events
-
-sessions
-  -> session_devices
-  -> session_events
-  -> scrcpy_streams
-```
-
-## Indexing Strategy
-
-Important indexes are included for:
-
-- tenant and club scoping: `users.organization_id`, `clubs.organization_id`
-- operator map lookups: `devices(club_id, room_id)`
-- hub dispatch: `device_commands(local_hub_id, status, created_at)`
-- active session lookups: `sessions(club_id, status, created_at)`, `session_devices(session_id, status)`
-- telemetry history: `device_telemetry(device_id, captured_at desc)`
-- alert dashboards: `monitoring_alerts(status, severity, last_seen_at desc)`
-- audit review: `audit_logs(organization_id, created_at desc)`
-
-## PostgreSQL vs SQLite
-
-### Production PostgreSQL
-
-- Prefer `uuid` or `bigserial` IDs depending on deployment policy.
-- Replace `TEXT` JSON payload fields with `jsonb`.
-- Replace timestamp text columns with `timestamptz`.
-- Convert status checks into native PostgreSQL enums if desired.
-
-### Current repository runtime
-
-- Uses `better-sqlite3` and a SQL migration at [db/migrations/0001_initial.sql](/Users/Yaroslav/Documents/dev/BizonVR-Operator/db/migrations/0001_initial.sql:1).
-- Keeps the same table names and foreign-key relationships.
-- Uses `CHECK` constraints instead of database-native enums for portability.
-
-## Local Hub SQLite Cache
-
-The Local Hub cache schema lives in [local-hub/migrations/0001_cache.sql](/Users/Yaroslav/Documents/dev/BizonVR-Operator/local-hub/migrations/0001_cache.sql:1).
-
-It persists:
-
-- last cloud snapshot of devices and sessions
-- accepted commands waiting to execute or sync back
-- scrcpy stream state
-- outbound events generated while offline
-
-This keeps command execution and session shutdown reliable during temporary internet loss.
+A future hosted deployment may map the API schema to PostgreSQL and add a
+separate operational delivery layer. Those changes are intentionally outside
+the current MVP and must not be read as present runtime requirements.
